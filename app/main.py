@@ -16,7 +16,17 @@ APP = FastAPI(title="pron-mvp")
 app = APP  # uvicorn main:app 用
 
 USE_PHONEME = os.getenv("USE_PHONEME_BACKEND", "false").lower() == "true"
-SIM_THRESH = float(os.getenv("REJECT_SIM_THRESH", "0.6"))  # 類似度しきい値（0~1）
+SIM_THRESH = float(os.getenv("REJECT_SIM_THRESH", "0.4"))  # 類似度しきい値（0~1）
+NOISE_ROBUST = os.getenv("NOISE_ROBUST", "true").lower() == "false"
+TRIM_RATIO = float(os.getenv("TRIM_RATIO", "0.1"))  # トリム平均率 0~0.4 目安0.1
+HPF_HZ = float(os.getenv("HPF_HZ", "60"))
+LPF_HZ = float(os.getenv("LPF_HZ", "12000"))
+PREEMPH = float(os.getenv("PREEMPH", "0.95"))
+ENERGY_WEIGHTING = os.getenv("ENERGY_WEIGHTING", "true").lower() == "true"
+ENERGY_PCTL = float(os.getenv("ENERGY_PCTL", "0.2"))  # 下位分位点（0~1）
+ENERGY_FLOOR_GAIN = float(os.getenv("ENERGY_FLOOR_GAIN", "1.2"))
+ENERGY_W_MIN = float(os.getenv("ENERGY_W_MIN", "0.1"))
+ENERGY_MASK = os.getenv("ENERGY_MASK", "true").lower() == "true"
 
 if not USE_PHONEME:
     BUNDLE = torchaudio.pipelines.WAV2VEC2_ASR_BASE_960H
@@ -67,7 +77,11 @@ def score(inp: ScoreIn):
         sr = 16000
     if wav.ndim > 1:
         wav = np.mean(wav, axis=1)
+    if NOISE_ROBUST:
+        wav = preprocess_wav_np(wav, sr)
     wav_t = torch.from_numpy(wav).float().unsqueeze(0)
+    if NOISE_ROBUST:
+        wav_t = bandpass_torch(wav_t, sr=16000, hpf_hz=HPF_HZ, lpf_hz=LPF_HZ)
 
     preset = PRESETS.get(inp.preset, PRESETS["adult"])
     text_words = text_to_words(inp.text)
@@ -114,6 +128,40 @@ def score(inp: ScoreIn):
         emission, _ = ASR_MODEL(wav_t)  # (emission, lengths)
         emission = emission.log_softmax(-1).squeeze(0)  # (T, V)
 
+    # 短時間RMSに基づくフレーム重み（教室ガヤ対策）
+    weights = None
+    if ENERGY_WEIGHTING:
+        # emissionの時間長Tに合わせた窓で音声RMSを計算
+        T = int(emission.size(0))
+        n_samples = int(wav_t.size(1))
+        # サンプル/フレーム比
+        samples_per_frame = max(1, n_samples // max(1, T))
+        x = wav_t.squeeze(0).detach().cpu().numpy()
+        rms = []
+        for i in range(T):
+            s = i * samples_per_frame
+            e = min(n_samples, s + samples_per_frame)
+            seg = x[s:e]
+            if seg.size == 0:
+                rms.append(0.0)
+            else:
+                rms.append(float(np.sqrt(np.mean(seg * seg))))
+        rms = np.asarray(rms, dtype=np.float32)
+        # 動的ノイズ床（下位分位点）
+        p = np.clip(ENERGY_PCTL, 0.0, 1.0)
+        floor = np.percentile(rms, p * 100.0)
+        thr = max(0.02, float(floor) * ENERGY_FLOOR_GAIN)
+        # 正規化重み
+        weights = rms - thr
+        weights[weights < 0] = 0.0
+        if weights.max() > 0:
+            weights = weights / (weights.max() + 1e-8)
+        weights = np.maximum(weights, ENERGY_W_MIN)
+        if ENERGY_MASK:
+            # しきい値未満は完全に無視
+            weights = np.where(rms >= thr, weights, 0.0)
+        weights = torch.from_numpy(weights).to(emission.device).float()  # (T,)
+
     # 類似度（後段の全体減点に使用）
     hyp_raw = ctc_greedy_decode(emission, LABELS, BLANK_ID)
     hyp = normalize_for_match(hyp_raw)
@@ -133,7 +181,20 @@ def score(inp: ScoreIn):
         ch = LABELS[tid]
         start = s * ratio / 16000.0
         end = e * ratio / 16000.0
-        seg_mean = float(emission[s:e, tid].mean().item())
+        if ENERGY_WEIGHTING and weights is not None:
+            # 重み付き平均（wは時間のみ依存）
+            w = weights[s:e]
+            vals = emission[s:e, tid]
+            if w.numel() > 0 and float(w.sum().item()) > 0:
+                seg_mean = float(
+                    (vals * w.unsqueeze(-1)).sum().item() / (w.sum().item())
+                )
+            else:
+                seg_mean = float(robust_segment_mean(vals, trim_ratio=TRIM_RATIO))
+        else:
+            seg_mean = float(
+                robust_segment_mean(emission[s:e, tid], trim_ratio=TRIM_RATIO)
+            )
         char_segments.append({"char": ch, "start": start, "end": end, "logp": seg_mean})
 
     # テキスト→IPA（単語ごとに分割）
@@ -214,11 +275,61 @@ def score(inp: ScoreIn):
             "penalty": float(penalty),
             "zero_phone_rate": float(zero_phone_rate),
             "struct_diff": float(struct_diff),
+            "noise_reduction": bool(NOISE_ROBUST),
+            "trim_ratio": float(TRIM_RATIO),
+            "preemphasis": float(PREEMPH),
+            "bandpass": {"hpf_hz": float(HPF_HZ), "lpf_hz": float(LPF_HZ)},
+            "energy_weighting": bool(ENERGY_WEIGHTING),
+            "energy_pctl": float(ENERGY_PCTL),
+            "energy_floor_gain": float(ENERGY_FLOOR_GAIN),
+            "energy_w_min": float(ENERGY_W_MIN),
+            "energy_mask": bool(ENERGY_MASK),
         },
     }
 
 
 # ---- helpers ----
+
+
+def trimmed_mean(arr, trim_ratio=0.1):
+    if not arr:
+        return 0.0
+    xs = np.array(arr, dtype=np.float32)
+    if xs.size < 3:
+        return float(xs.mean())
+    lo = int(len(xs) * trim_ratio)
+    hi = len(xs) - lo
+    xs.sort()
+    xs = xs[lo:hi] if lo < hi else xs
+    return float(xs.mean()) if xs.size > 0 else 0.0
+
+
+def robust_segment_mean(tensor_vals, trim_ratio=0.1):
+    if tensor_vals.numel() == 0:
+        return 0.0
+    xs = tensor_vals.detach().float().cpu().numpy()
+    return trimmed_mean(xs.tolist(), trim_ratio)
+
+
+def preprocess_wav_np(wav: np.ndarray, sr: int) -> np.ndarray:
+    y, _ = librosa.effects.trim(wav, top_db=30)
+    y = librosa.effects.preemphasis(y, coef=PREEMPH)
+    peak = np.max(np.abs(y)) if y.size else 0.0
+    if peak > 1e-6:
+        y = 0.98 * y / peak
+    return y
+
+
+def bandpass_torch(
+    wav_t: torch.Tensor, sr: int, hpf_hz: float, lpf_hz: float
+) -> torch.Tensor:
+    y = torchaudio.functional.highpass_biquad(wav_t, sample_rate=sr, cutoff_freq=hpf_hz)
+    y = torchaudio.functional.lowpass_biquad(y, sample_rate=sr, cutoff_freq=lpf_hz)
+    with torch.no_grad():
+        peak = y.abs().amax()
+        if torch.isfinite(peak) and peak > 1e-6:
+            y = y * (0.98 / peak)
+    return y
 
 
 def ctc_greedy_decode(emission, labels, blank_id: int) -> str:
@@ -287,7 +398,7 @@ def aggregate_word_scores_from_time(
             ov = max(0.0, min(we, ph["end"]) - max(ws, ph["start"]))
             if ov > 0:
                 ph_in.append(ph["score"])
-        score = int(np.clip(np.mean(ph_in) if ph_in else 0, 0, 100))
+        score = int(np.clip(trimmed_mean(ph_in, TRIM_RATIO) if ph_in else 0, 0, 100))
         out.append(
             {
                 "w": text_words[i] if i < len(text_words) else f"word{i+1}",
@@ -316,7 +427,9 @@ def words_from_phone_sequence(
                 }
             )
             continue
-        score = int(np.clip(np.mean([p["score"] for p in slice_]), 0, 100))
+        score = int(
+            np.clip(trimmed_mean([p["score"] for p in slice_], TRIM_RATIO), 0, 100)
+        )
         out.append(
             {
                 "w": text_words[i] if i < len(text_words) else f"word{i+1}",
@@ -342,7 +455,7 @@ def score_phones_from_chars(emission, approx, char_segments, preset):
             ov = max(0.0, min(e, ch["end"]) - max(s, ch["start"]))
             if ov > 0:
                 vals.append(ch["logp"])
-        lp = float(np.mean(vals)) if vals else -5.0
+        lp = float(trimmed_mean(vals, TRIM_RATIO)) if vals else -5.0
         scored.append(
             {
                 "p": ph["p"],

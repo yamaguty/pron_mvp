@@ -10,11 +10,13 @@ from pydantic import BaseModel
 from phonemizer import phonemize
 from phonemizer.separator import Separator
 from ctc_align import build_trellis, backtrack, merge_repeats
+import difflib  # 類似度計算
 
 APP = FastAPI(title="pron-mvp")
 app = APP  # uvicorn main:app 用
 
 USE_PHONEME = os.getenv("USE_PHONEME_BACKEND", "false").lower() == "true"
+SIM_THRESH = float(os.getenv("REJECT_SIM_THRESH", "0.6"))  # 類似度しきい値（0~1）
 
 if not USE_PHONEME:
     BUNDLE = torchaudio.pipelines.WAV2VEC2_ASR_BASE_960H
@@ -112,6 +114,12 @@ def score(inp: ScoreIn):
         emission, _ = ASR_MODEL(wav_t)  # (emission, lengths)
         emission = emission.log_softmax(-1).squeeze(0)  # (T, V)
 
+    # 類似度（後段の全体減点に使用）
+    hyp_raw = ctc_greedy_decode(emission, LABELS, BLANK_ID)
+    hyp = normalize_for_match(hyp_raw)
+    tgt = normalize_for_match(inp.text)
+    sim = similarity_ratio(hyp, tgt)
+
     ref = normalize_text(inp.text)
     tokens = [CHAR_TO_ID[c] for c in ref if c in CHAR_TO_ID]
     trellis = build_trellis(emission, tokens, BLANK_ID)
@@ -159,11 +167,38 @@ def score(inp: ScoreIn):
     # 単語スコア（単語区間に重なる phone_like の平均）
     words_scored = aggregate_word_scores_from_time(word_spans, phone_like, text_words)
 
-    overall = int(
+    base_overall = float(
         np.clip(
             np.mean([w["score"] for w in words_scored]) if words_scored else 0, 0, 100
         )
     )
+
+    # 構造・不一致に基づく全体減点（部分一致の単語スコアは保持）
+    penalty = 1.0
+    # 類似度がしきい値未満なら二乗で強めに減点
+    if len(hyp) == 0:
+        penalty *= 0.3
+    elif sim < SIM_THRESH:
+        penalty *= max(0.0, (sim / SIM_THRESH)) ** 2
+    # 単語数の構造差（文字ベース境界 vs 期待単語数）
+    struct_diff = 0.0
+    try:
+        struct_diff = abs(len(word_spans) - len(text_words)) / max(1, len(text_words))
+    except Exception:
+        struct_diff = 0.0
+    penalty *= max(0.4, 1.0 - 0.8 * struct_diff)
+    # phoneレベルで0点が多い場合はさらに減点
+    zero_phone_rate = 0.0
+    if len(phone_like) > 0:
+        zero_phone_rate = sum(1 for p in phone_like if p.get("score", 0) == 0) / len(
+            phone_like
+        )
+        penalty *= max(0.3, 1.0 - 0.8 * zero_phone_rate)
+    # 単語の中に0点がある場合の固定減点
+    if any(w.get("score", 0) == 0 for w in words_scored):
+        penalty *= 0.6
+
+    overall = int(np.clip(base_overall * penalty, 0, 100))
     return {
         "overall": overall,
         "preset": inp.preset,
@@ -174,11 +209,38 @@ def score(inp: ScoreIn):
             "latency_ms": int((time.time() - t0) * 1000),
             "frames": int(emission.size(0)),
             "backend": "char-ctc",
+            "sim": float(sim),
+            "hyp": hyp_raw,
+            "penalty": float(penalty),
+            "zero_phone_rate": float(zero_phone_rate),
+            "struct_diff": float(struct_diff),
         },
     }
 
 
 # ---- helpers ----
+
+
+def ctc_greedy_decode(emission, labels, blank_id: int) -> str:
+    ids = emission.argmax(dim=-1).tolist()
+    out = []
+    last = None
+    for i in ids:
+        if i == blank_id or i == last:
+            last = i
+            continue
+        out.append(labels[i])
+        last = i
+    return "".join(out)
+
+
+def normalize_for_match(s: str) -> str:
+    s = normalize_text(s)
+    return s.replace("|", "")
+
+
+def similarity_ratio(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
 
 
 def normalize_text(s: str) -> str:

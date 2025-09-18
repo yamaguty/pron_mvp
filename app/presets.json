@@ -1,0 +1,6 @@
+{
+    "elem": {"tau": 0.35, "beta": 0.10, "len_tol": 0.35, "stress": 0.5},
+    "junior": {"tau": 0.45, "beta": 0.10, "len_tol": 0.25, "stress": 0.7},
+    "high": {"tau": 0.55, "beta": 0.08, "len_tol": 0.20, "stress": 0.9},
+    "adult": {"tau": 0.65, "beta": 0.08, "len_tol": 0.15, "stress": 1.0}
+}

@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, time, json, re
-from typing import List, Dict
+from typing import List, Dict, Optional
 import numpy as np
 import soundfile as sf
 import librosa
@@ -16,7 +16,21 @@ APP = FastAPI(title="pron-mvp")
 app = APP  # uvicorn main:app 用
 
 USE_PHONEME = os.getenv("USE_PHONEME_BACKEND", "false").lower() == "true"
-SIM_THRESH = float(os.getenv("REJECT_SIM_THRESH", "0.6"))  # 類似度しきい値（0~1）
+# デフォルト値をより緩い設定に変更
+SIM_THRESH = float(os.getenv("REJECT_SIM_THRESH", "0.4"))  # 類似度しきい値（0~1）
+STRUCT_PENALTY_FACTOR = float(
+    os.getenv("STRUCT_PENALTY_FACTOR", "0.4")
+)  # 構造差ペナルティ係数
+ZERO_PHONE_PENALTY_FACTOR = float(
+    os.getenv("ZERO_PHONE_PENALTY_FACTOR", "0.4")
+)  # ゼロ音素ペナルティ係数
+WORD_ZERO_PENALTY = float(os.getenv("WORD_ZERO_PENALTY", "0.7"))  # 単語0点ペナルティ
+
+# 無音除去/前処理用パラメータ
+SILENCE_TOP_DB = float(os.getenv("SILENCE_TOP_DB", "25"))  # 無音判定しきい値（dB）
+MIN_VOICE_MS = int(os.getenv("MIN_VOICE_MS", "80"))  # セグメント最小長（ms）
+PAD_MS = int(os.getenv("PAD_MS", "50"))  # セグメント前後の余白（ms）
+PREEMPH_ALPHA = float(os.getenv("PREEMPH_ALPHA", "0.0"))  # 0で無効、例: 0.97
 
 if not USE_PHONEME:
     BUNDLE = torchaudio.pipelines.WAV2VEC2_ASR_BASE_960H
@@ -36,10 +50,26 @@ with open(os.path.join(os.path.dirname(__file__), "presets.json"), "r") as f:
 SEP = Separator(phone=" ", word="|", syllable="")
 
 
+class ScoringParams(BaseModel):
+    """採点パラメータ"""
+
+    tau: Optional[float] = None  # 音素レベル採点の閾値（低いほど緩い）
+    beta: Optional[float] = None  # 音素レベル採点の感度（低いほど緩い）
+    sim_thresh: Optional[float] = None  # 類似度しきい値（0~1、低いほど緩い）
+    struct_penalty_factor: Optional[float] = (
+        None  # 構造差ペナルティ係数（0~1、低いほど緩い）
+    )
+    zero_phone_penalty_factor: Optional[float] = (
+        None  # ゼロ音素ペナルティ係数（0~1、低いほど緩い）
+    )
+    word_zero_penalty: Optional[float] = None  # 単語0点ペナルティ（0~1、低いほど緩い）
+
+
 class ScoreIn(BaseModel):
     text: str = "This is a test."
     preset: str = "adult"  # elem|junior|high|adult
     audio_path: str | None = None  # 未指定なら /data/samples/sample.wav
+    scoring_params: Optional[ScoringParams] = None  # カスタム採点パラメータ
 
 
 @APP.get("/warmup")
@@ -62,14 +92,49 @@ def score(inp: ScoreIn):
     t0 = time.time()
     audio_path = inp.audio_path or "/data/samples/sample.wav"
     wav, sr = sf.read(audio_path)
-    if sr != 16000:
-        wav = librosa.resample(wav.astype(np.float32), orig_sr=sr, target_sr=16000)
-        sr = 16000
-    if wav.ndim > 1:
-        wav = np.mean(wav, axis=1)
+    # ---- 前処理：無音トリム・（任意）プレエンファシス・リサンプリング・モノラル化 ----
+    wav, sr = preprocess_wav(
+        wav,
+        sr,
+        target_sr=16000,
+        top_db=SILENCE_TOP_DB,
+        min_voice_ms=MIN_VOICE_MS,
+        pad_ms=PAD_MS,
+        preemph_alpha=PREEMPH_ALPHA,
+    )
     wav_t = torch.from_numpy(wav).float().unsqueeze(0)
 
-    preset = PRESETS.get(inp.preset, PRESETS["adult"])
+    # 採点パラメータの設定（カスタムパラメータがあれば優先、なければpreset、最後にデフォルト）
+    preset = PRESETS.get(inp.preset, PRESETS["adult"]).copy()
+    if inp.scoring_params:
+        if inp.scoring_params.tau is not None:
+            preset["tau"] = inp.scoring_params.tau
+        if inp.scoring_params.beta is not None:
+            preset["beta"] = inp.scoring_params.beta
+
+    # グローバルパラメータの設定
+    sim_thresh = (
+        inp.scoring_params.sim_thresh
+        if inp.scoring_params and inp.scoring_params.sim_thresh is not None
+        else SIM_THRESH
+    )
+    struct_penalty_factor = (
+        inp.scoring_params.struct_penalty_factor
+        if inp.scoring_params and inp.scoring_params.struct_penalty_factor is not None
+        else STRUCT_PENALTY_FACTOR
+    )
+    zero_phone_penalty_factor = (
+        inp.scoring_params.zero_phone_penalty_factor
+        if inp.scoring_params
+        and inp.scoring_params.zero_phone_penalty_factor is not None
+        else ZERO_PHONE_PENALTY_FACTOR
+    )
+    word_zero_penalty = (
+        inp.scoring_params.word_zero_penalty
+        if inp.scoring_params and inp.scoring_params.word_zero_penalty is not None
+        else WORD_ZERO_PENALTY
+    )
+
     text_words = text_to_words(inp.text)
 
     if USE_PHONEME:
@@ -178,25 +243,25 @@ def score(inp: ScoreIn):
     # 類似度がしきい値未満なら二乗で強めに減点
     if len(hyp) == 0:
         penalty *= 0.3
-    elif sim < SIM_THRESH:
-        penalty *= max(0.0, (sim / SIM_THRESH)) ** 2
+    elif sim < sim_thresh:
+        penalty *= max(0.0, (sim / sim_thresh)) ** 2
     # 単語数の構造差（文字ベース境界 vs 期待単語数）
     struct_diff = 0.0
     try:
         struct_diff = abs(len(word_spans) - len(text_words)) / max(1, len(text_words))
     except Exception:
         struct_diff = 0.0
-    penalty *= max(0.4, 1.0 - 0.8 * struct_diff)
+    penalty *= max(0.4, 1.0 - struct_penalty_factor * struct_diff)
     # phoneレベルで0点が多い場合はさらに減点
     zero_phone_rate = 0.0
     if len(phone_like) > 0:
         zero_phone_rate = sum(1 for p in phone_like if p.get("score", 0) == 0) / len(
             phone_like
         )
-        penalty *= max(0.3, 1.0 - 0.8 * zero_phone_rate)
+        penalty *= max(0.3, 1.0 - zero_phone_penalty_factor * zero_phone_rate)
     # 単語の中に0点がある場合の固定減点
     if any(w.get("score", 0) == 0 for w in words_scored):
-        penalty *= 0.6
+        penalty *= word_zero_penalty
 
     overall = int(np.clip(base_overall * penalty, 0, 100))
     return {
@@ -214,6 +279,12 @@ def score(inp: ScoreIn):
             "penalty": float(penalty),
             "zero_phone_rate": float(zero_phone_rate),
             "struct_diff": float(struct_diff),
+            "scoring_params": {
+                "sim_thresh": float(sim_thresh),
+                "struct_penalty_factor": float(struct_penalty_factor),
+                "zero_phone_penalty_factor": float(zero_phone_penalty_factor),
+                "word_zero_penalty": float(word_zero_penalty),
+            },
         },
     }
 
@@ -373,3 +444,69 @@ def phones_to_scores(phones_ipa, preset):
             }
         )
     return out
+
+
+def preprocess_wav(
+    wav: np.ndarray,
+    sr: int,
+    target_sr: int = 16000,
+    top_db: float = 20.0,
+    min_voice_ms: int = 80,
+    pad_ms: int = 50,
+    preemph_alpha: float = 0.0,
+) -> tuple[np.ndarray, int]:
+    """無音区間をトリムし、最小長未満の断片を捨て、必要に応じて前後に余白を残す。
+    その後リサンプリングとモノラル化を行う。
+
+    - top_db: 無音判定(大きいほど厳しく切る)
+    - min_voice_ms: これ未満の短いセグメントを除外
+    - pad_ms: 各セグメントの前後に残す余白
+    - preemph_alpha: プレエンファシス係数(0で無効)
+    """
+    # ensure float32 numpy
+    wav_np = np.asarray(wav, dtype=np.float32)
+    if wav_np.ndim > 1:
+        wav_np = np.mean(wav_np, axis=1)
+
+    # リサンプリングを先に統一
+    if sr != target_sr:
+        wav_np = librosa.resample(wav_np, orig_sr=sr, target_sr=target_sr)
+        sr = target_sr
+
+    # プレエンファシス（任意）
+    if preemph_alpha and 0.0 < preemph_alpha < 1.0:
+        # y[n] = x[n] - a * x[n-1]
+        y = np.empty_like(wav_np)
+        y[0] = wav_np[0]
+        y[1:] = wav_np[1:] - preemph_alpha * wav_np[:-1]
+        wav_np = y
+
+    # 無音分割
+    intervals = librosa.effects.split(wav_np, top_db=top_db)
+    if intervals.size == 0:
+        return wav_np, sr
+
+    # パディングサンプル数
+    pad = int(pad_ms * sr / 1000)
+    min_len = int(min_voice_ms * sr / 1000)
+
+    segments = []
+    for beg, end in intervals:
+        # 余白を付与
+        s = max(0, beg - pad)
+        e = min(len(wav_np), end + pad)
+        if e - s >= min_len:
+            segments.append(wav_np[s:e])
+
+    if not segments:
+        return wav_np, sr
+
+    # セグメント連結（間は無音を挿入しない）
+    trimmed = np.concatenate(segments, axis=0)
+
+    # クリッピング防止の軽い正規化
+    mx = np.max(np.abs(trimmed))
+    if mx > 1.0:
+        trimmed = trimmed / mx
+
+    return trimmed.astype(np.float32), sr

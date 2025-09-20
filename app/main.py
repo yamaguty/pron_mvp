@@ -28,6 +28,14 @@ ENERGY_FLOOR_GAIN = float(os.getenv("ENERGY_FLOOR_GAIN", "1.2"))
 ENERGY_W_MIN = float(os.getenv("ENERGY_W_MIN", "0.1"))
 ENERGY_MASK = os.getenv("ENERGY_MASK", "true").lower() == "true"
 
+# 高度なノイズ除去機能の環境変数
+SPECTRAL_SUBTRACTION = os.getenv("SPECTRAL_SUBTRACTION", "true").lower() == "true"
+WIENER_FILTER = os.getenv("WIENER_FILTER", "true").lower() == "true"
+VAD_ENABLED = os.getenv("VAD_ENABLED", "true").lower() == "true"
+NOISE_REDUCTION_ALPHA = float(os.getenv("NOISE_REDUCTION_ALPHA", "2.0"))  # スペクトラムサブトラクションの強度
+NOISE_REDUCTION_BETA = float(os.getenv("NOISE_REDUCTION_BETA", "0.01"))  # ウィーナーフィルタの強度
+VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.3"))  # 音声活動検出のしきい値
+
 if not USE_PHONEME:
     BUNDLE = torchaudio.pipelines.WAV2VEC2_ASR_BASE_960H
     ASR_MODEL = BUNDLE.get_model().eval()
@@ -131,36 +139,8 @@ def score(inp: ScoreIn):
     # 短時間RMSに基づくフレーム重み（教室ガヤ対策）
     weights = None
     if ENERGY_WEIGHTING:
-        # emissionの時間長Tに合わせた窓で音声RMSを計算
-        T = int(emission.size(0))
-        n_samples = int(wav_t.size(1))
-        # サンプル/フレーム比
-        samples_per_frame = max(1, n_samples // max(1, T))
-        x = wav_t.squeeze(0).detach().cpu().numpy()
-        rms = []
-        for i in range(T):
-            s = i * samples_per_frame
-            e = min(n_samples, s + samples_per_frame)
-            seg = x[s:e]
-            if seg.size == 0:
-                rms.append(0.0)
-            else:
-                rms.append(float(np.sqrt(np.mean(seg * seg))))
-        rms = np.asarray(rms, dtype=np.float32)
-        # 動的ノイズ床（下位分位点）
-        p = np.clip(ENERGY_PCTL, 0.0, 1.0)
-        floor = np.percentile(rms, p * 100.0)
-        thr = max(0.02, float(floor) * ENERGY_FLOOR_GAIN)
-        # 正規化重み
-        weights = rms - thr
-        weights[weights < 0] = 0.0
-        if weights.max() > 0:
-            weights = weights / (weights.max() + 1e-8)
-        weights = np.maximum(weights, ENERGY_W_MIN)
-        if ENERGY_MASK:
-            # しきい値未満は完全に無視
-            weights = np.where(rms >= thr, weights, 0.0)
-        weights = torch.from_numpy(weights).to(emission.device).float()  # (T,)
+        # 適応的エネルギー重み付けを使用（環境音や周囲の人の声をより効果的に除去）
+        weights = adaptive_energy_weighting(wav_t.squeeze(0).detach().cpu().numpy(), emission)
 
     # 類似度（後段の全体減点に使用）
     hyp_raw = ctc_greedy_decode(emission, LABELS, BLANK_ID)
@@ -284,6 +264,12 @@ def score(inp: ScoreIn):
             "energy_floor_gain": float(ENERGY_FLOOR_GAIN),
             "energy_w_min": float(ENERGY_W_MIN),
             "energy_mask": bool(ENERGY_MASK),
+            "spectral_subtraction": bool(SPECTRAL_SUBTRACTION),
+            "wiener_filter": bool(WIENER_FILTER),
+            "vad_enabled": bool(VAD_ENABLED),
+            "noise_reduction_alpha": float(NOISE_REDUCTION_ALPHA),
+            "noise_reduction_beta": float(NOISE_REDUCTION_BETA),
+            "vad_threshold": float(VAD_THRESHOLD),
         },
     }
 
@@ -311,9 +297,185 @@ def robust_segment_mean(tensor_vals, trim_ratio=0.1):
     return trimmed_mean(xs.tolist(), trim_ratio)
 
 
+def spectral_subtraction(wav: np.ndarray, sr: int, alpha: float = 2.0) -> np.ndarray:
+    """
+    スペクトラムサブトラクションによるノイズ除去
+    環境音や周囲の人の声を効果的に除去
+    """
+    # 短時間フーリエ変換
+    stft = librosa.stft(wav, n_fft=2048, hop_length=512, win_length=2048)
+    magnitude = np.abs(stft)
+    phase = np.angle(stft)
+    
+    # ノイズ推定（最初の数フレームから）
+    noise_frames = min(10, magnitude.shape[1] // 4)
+    noise_spectrum = np.mean(magnitude[:, :noise_frames], axis=1, keepdims=True)
+    
+    # スペクトラムサブトラクション
+    enhanced_magnitude = magnitude - alpha * noise_spectrum
+    enhanced_magnitude = np.maximum(enhanced_magnitude, 0.1 * magnitude)  # 最小値制限
+    
+    # 逆短時間フーリエ変換
+    enhanced_stft = enhanced_magnitude * np.exp(1j * phase)
+    enhanced_wav = librosa.istft(enhanced_stft, hop_length=512, win_length=2048)
+    
+    return enhanced_wav
+
+
+def wiener_filter(wav: np.ndarray, sr: int, beta: float = 0.01) -> np.ndarray:
+    """
+    ウィーナーフィルタによる適応的ノイズ除去
+    周囲の人の声などの非定常ノイズに効果的
+    """
+    # 短時間フーリエ変換
+    stft = librosa.stft(wav, n_fft=2048, hop_length=512, win_length=2048)
+    magnitude = np.abs(stft)
+    phase = np.angle(stft)
+    
+    # ノイズ推定（低エネルギー部分から）
+    energy = np.sum(magnitude**2, axis=0)
+    noise_frames = energy < np.percentile(energy, 20)
+    noise_spectrum = np.mean(magnitude[:, noise_frames], axis=1, keepdims=True)
+    
+    # ウィーナーフィルタの計算
+    signal_spectrum = magnitude**2
+    noise_spectrum_sq = noise_spectrum**2
+    
+    # ウィーナーフィルタ係数
+    wiener_coeff = signal_spectrum / (signal_spectrum + beta * noise_spectrum_sq)
+    wiener_coeff = np.maximum(wiener_coeff, 0.1)  # 最小値制限
+    
+    # フィルタ適用
+    enhanced_magnitude = magnitude * wiener_coeff
+    
+    # 逆短時間フーリエ変換
+    enhanced_stft = enhanced_magnitude * np.exp(1j * phase)
+    enhanced_wav = librosa.istft(enhanced_stft, hop_length=512, win_length=2048)
+    
+    return enhanced_wav
+
+
+def voice_activity_detection(wav: np.ndarray, sr: int, threshold: float = 0.3) -> np.ndarray:
+    """
+    音声活動検出（VAD）による無音部分の除去
+    周囲の人の声が入っていない部分を検出
+    """
+    # 短時間エネルギー計算
+    frame_length = int(0.025 * sr)  # 25ms
+    hop_length = int(0.010 * sr)    # 10ms
+    
+    # フレームごとのエネルギー
+    energy = []
+    for i in range(0, len(wav) - frame_length, hop_length):
+        frame = wav[i:i + frame_length]
+        energy.append(np.sum(frame**2))
+    
+    energy = np.array(energy)
+    
+    # エネルギー正規化
+    if energy.max() > 0:
+        energy = energy / energy.max()
+    
+    # 音声活動検出
+    voice_frames = energy > threshold
+    
+    # マスク作成
+    mask = np.zeros(len(wav))
+    for i, is_voice in enumerate(voice_frames):
+        start = i * hop_length
+        end = min(start + frame_length, len(wav))
+        if is_voice:
+            mask[start:end] = 1.0
+    
+    # 音声部分のみを抽出
+    enhanced_wav = wav * mask
+    
+    return enhanced_wav
+
+
+def advanced_noise_reduction(wav: np.ndarray, sr: int) -> np.ndarray:
+    """
+    高度なノイズ除去パイプライン
+    複数の手法を組み合わせて環境音や周囲の人の声を除去
+    """
+    enhanced_wav = wav.copy()
+    
+    # 1. 音声活動検出による無音部分除去
+    if VAD_ENABLED:
+        enhanced_wav = voice_activity_detection(enhanced_wav, sr, VAD_THRESHOLD)
+    
+    # 2. スペクトラムサブトラクション
+    if SPECTRAL_SUBTRACTION:
+        enhanced_wav = spectral_subtraction(enhanced_wav, sr, NOISE_REDUCTION_ALPHA)
+    
+    # 3. ウィーナーフィルタ
+    if WIENER_FILTER:
+        enhanced_wav = wiener_filter(enhanced_wav, sr, NOISE_REDUCTION_BETA)
+    
+    # 4. 既存のバンドパスフィルタとの組み合わせ
+    enhanced_wav = librosa.effects.preemphasis(enhanced_wav, coef=PREEMPH)
+    
+    # 5. 正規化
+    peak = np.max(np.abs(enhanced_wav)) if enhanced_wav.size else 0.0
+    if peak > 1e-6:
+        enhanced_wav = 0.98 * enhanced_wav / peak
+    
+    return enhanced_wav
+
+
+def adaptive_energy_weighting(wav: np.ndarray, emission: torch.Tensor) -> torch.Tensor:
+    """
+    適応的エネルギー重み付け
+    環境音や周囲の人の声の影響を最小化
+    """
+    T = int(emission.size(0))
+    n_samples = len(wav)
+    samples_per_frame = max(1, n_samples // max(1, T))
+    
+    # フレームごとのRMS計算
+    rms = []
+    for i in range(T):
+        s = i * samples_per_frame
+        e = min(n_samples, s + samples_per_frame)
+        seg = wav[s:e]
+        if seg.size == 0:
+            rms.append(0.0)
+        else:
+            rms.append(float(np.sqrt(np.mean(seg * seg))))
+    
+    rms = np.asarray(rms, dtype=np.float32)
+    
+    # 適応的しきい値計算
+    # より厳しいしきい値で環境音を除去
+    p = np.clip(ENERGY_PCTL, 0.0, 1.0)
+    floor = np.percentile(rms, p * 100.0)
+    thr = max(0.05, float(floor) * ENERGY_FLOOR_GAIN * 1.5)  # より厳しいしきい値
+    
+    # 重み計算
+    weights = rms - thr
+    weights[weights < 0] = 0.0
+    
+    if weights.max() > 0:
+        weights = weights / (weights.max() + 1e-8)
+    
+    # より厳しいマスキング
+    weights = np.maximum(weights, ENERGY_W_MIN * 0.5)  # より厳しい最小重み
+    weights = np.where(rms >= thr, weights, 0.0)
+    
+    return torch.from_numpy(weights).to(emission.device).float()
+
+
 def preprocess_wav_np(wav: np.ndarray, sr: int) -> np.ndarray:
+    """
+    既存の前処理に高度なノイズ除去を追加
+    """
+    # 既存の処理
     y, _ = librosa.effects.trim(wav, top_db=30)
     y = librosa.effects.preemphasis(y, coef=PREEMPH)
+    
+    # 高度なノイズ除去を追加
+    y = advanced_noise_reduction(y, sr)
+    
     peak = np.max(np.abs(y)) if y.size else 0.0
     if peak > 1e-6:
         y = 0.98 * y / peak

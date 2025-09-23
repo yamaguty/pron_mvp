@@ -29,6 +29,20 @@ ENERGY_FLOOR_GAIN = float(os.getenv("ENERGY_FLOOR_GAIN", "1.2"))
 ENERGY_W_MIN = float(os.getenv("ENERGY_W_MIN", "0.1"))
 ENERGY_MASK = os.getenv("ENERGY_MASK", "true").lower() == "true"
 
+# Words allowed to miss without triggering zero-score penalties
+ZERO_SCORE_WORD_WHITELIST = {
+    "a",
+    "an",
+    "the",
+    "to",
+    "of",
+    "and",
+    "in",
+    "for",
+    "or",
+    "but",
+}
+
 _ASR_DEVICE_STR = os.getenv("ASR_DEVICE", "cpu")
 try:
     ASR_DEVICE = torch.device(_ASR_DEVICE_STR)
@@ -182,9 +196,14 @@ def score(inp: ScoreIn):
         # phone_like を ipa_words の形に合わせて順に切り出し、平均で単語スコア
         words_scored = words_from_phone_sequence(phone_like, ipa_words, text_words)
 
+        scores_for_mean = [
+            w["score"]
+            for w in words_scored
+            if not (w["score"] == 0 and w.get("whitelisted"))
+        ]
         overall = int(
             np.clip(
-                np.mean([w["score"] for w in words_scored]) if words_scored else 0,
+                np.mean(scores_for_mean) if scores_for_mean else 0,
                 0,
                 100,
             )
@@ -303,15 +322,23 @@ def score(inp: ScoreIn):
             approx.append({"p": p, "start": cur, "end": cur + step})
             cur += step
         scored = score_phones_from_chars(emission, approx, char_segments, preset)
+        word_label = text_words[i] if i < len(text_words) else f"word{i+1}"
+        is_whitelisted = is_whitelisted_zero_word(word_label)
+        for sc in scored:
+            sc["word"] = word_label
+            sc["whitelisted"] = is_whitelisted
         phone_like.extend(scored)
 
     # 単語スコア（単語区間に重なる phone_like の平均）
     words_scored = aggregate_word_scores_from_time(word_spans, phone_like, text_words)
 
+    scores_for_mean = [
+        w["score"]
+        for w in words_scored
+        if not (w["score"] == 0 and w.get("whitelisted"))
+    ]
     base_overall = float(
-        np.clip(
-            np.mean([w["score"] for w in words_scored]) if words_scored else 0, 0, 100
-        )
+        np.clip(np.mean(scores_for_mean) if scores_for_mean else 0, 0, 100)
     )
 
     # 構造・不一致に基づく全体減点（部分一致の単語スコアは保持）
@@ -330,13 +357,16 @@ def score(inp: ScoreIn):
     penalty *= max(0.4, 1.0 - 0.8 * struct_diff)
     # phoneレベルで0点が多い場合はさらに減点
     zero_phone_rate = 0.0
-    if len(phone_like) > 0:
-        zero_phone_rate = sum(1 for p in phone_like if p.get("score", 0) == 0) / len(
-            phone_like
+    filtered_phones = [p for p in phone_like if not p.get("whitelisted")]
+    if filtered_phones:
+        zero_phone_rate = sum(1 for p in filtered_phones if p.get("score", 0) == 0) / len(
+            filtered_phones
         )
         penalty *= max(0.3, 1.0 - 0.8 * zero_phone_rate)
-    # 単語の中に0点がある場合の固定減点
-    if any(w.get("score", 0) == 0 for w in words_scored):
+    # 単語の中に0点がある場合の固定減点（ホワイトリストは除外）
+    if any(
+        w.get("score", 0) == 0 and not w.get("whitelisted") for w in words_scored
+    ):
         penalty *= 0.6
 
     overall = int(np.clip(base_overall * penalty, 0, 100))
@@ -471,6 +501,10 @@ def text_to_words(s: str) -> List[str]:
     return ws
 
 
+def is_whitelisted_zero_word(word: str) -> bool:
+    return word.strip().lower() in ZERO_SCORE_WORD_WHITELIST
+
+
 def word_spans_from_chars(char_segments: List[Dict]) -> List[tuple]:
     """'|'（空白）で区切って (start,end) の単語区間リストを返す。"""
     spans = []
@@ -502,10 +536,12 @@ def aggregate_word_scores_from_time(
             if ov > 0:
                 ph_in.append(ph["score"])
         score = int(np.clip(trimmed_mean(ph_in, TRIM_RATIO) if ph_in else 0, 0, 100))
+        word_label = text_words[i] if i < len(text_words) else f"word{i+1}"
         out.append(
             {
-                "w": text_words[i] if i < len(text_words) else f"word{i+1}",
+                "w": word_label,
                 "score": score,
+                "whitelisted": is_whitelisted_zero_word(word_label),
             }
         )
     return out
@@ -519,14 +555,16 @@ def words_from_phone_sequence(
     """
     out, idx = [], 0
     for i, phones in enumerate(ipa_words):
+        word_label = text_words[i] if i < len(text_words) else f"word{i+1}"
         n = len(phones)
         slice_ = phone_like[idx : idx + n]
         idx += n
         if not slice_:
             out.append(
                 {
-                    "w": text_words[i] if i < len(text_words) else f"word{i+1}",
+                    "w": word_label,
                     "score": 0,
+                    "whitelisted": is_whitelisted_zero_word(word_label),
                 }
             )
             continue
@@ -535,8 +573,9 @@ def words_from_phone_sequence(
         )
         out.append(
             {
-                "w": text_words[i] if i < len(text_words) else f"word{i+1}",
+                "w": word_label,
                 "score": score,
+                "whitelisted": is_whitelisted_zero_word(word_label),
             }
         )
     return out

@@ -17,10 +17,10 @@ app = APP  # uvicorn main:app 用
 
 USE_PHONEME = os.getenv("USE_PHONEME_BACKEND", "false").lower() == "true"
 SIM_THRESH = float(os.getenv("REJECT_SIM_THRESH", "0.4"))  # 類似度しきい値（0~1）
-NOISE_ROBUST = os.getenv("NOISE_ROBUST", "true").lower() == "false"
+NOISE_ROBUST = os.getenv("NOISE_ROBUST", "true").lower() == "true"
 TRIM_RATIO = float(os.getenv("TRIM_RATIO", "0.1"))  # トリム平均率 0~0.4 目安0.1
-HPF_HZ = float(os.getenv("HPF_HZ", "60"))
-LPF_HZ = float(os.getenv("LPF_HZ", "12000"))
+HPF_HZ = float(os.getenv("HPF_HZ", "20"))
+LPF_HZ = float(os.getenv("LPF_HZ", "7900"))
 PREEMPH = float(os.getenv("PREEMPH", "0.95"))
 ENERGY_WEIGHTING = os.getenv("ENERGY_WEIGHTING", "true").lower() == "true"
 ENERGY_PCTL = float(os.getenv("ENERGY_PCTL", "0.2"))  # 下位分位点（0~1）
@@ -79,9 +79,19 @@ def score(inp: ScoreIn):
         wav = np.mean(wav, axis=1)
     if NOISE_ROBUST:
         wav = preprocess_wav_np(wav, sr)
+        print("DEBUG preprocess: len=", len(wav), 
+            "dtype=", wav.dtype, 
+            "RMS=", float(np.sqrt(np.mean(wav**2))) if wav.size else 0.0, flush=True)
+
     wav_t = torch.from_numpy(wav).float().unsqueeze(0)
+
     if NOISE_ROBUST:
         wav_t = bandpass_torch(wav_t, sr=16000, hpf_hz=HPF_HZ, lpf_hz=LPF_HZ)
+        print("DEBUG bandpass: shape=", tuple(wav_t.shape),
+            "RMS=", float(wav_t.pow(2).mean().sqrt().item()),
+            "min=", float(wav_t.min().item()),
+            "max=", float(wav_t.max().item()), flush=True)
+
 
     preset = PRESETS.get(inp.preset, PRESETS["adult"])
     text_words = text_to_words(inp.text)
@@ -312,12 +322,22 @@ def robust_segment_mean(tensor_vals, trim_ratio=0.1):
 
 
 def preprocess_wav_np(wav: np.ndarray, sr: int) -> np.ndarray:
-    y, _ = librosa.effects.trim(wav, top_db=30)
+    y, _ = librosa.effects.trim(wav, top_db=20)
+
+    # トリムで空 or 短すぎる場合は元の波形を使う
+    if y.size == 0 or len(y) < int(0.3 * sr):
+        y = wav
+
+    # プリエンファシス
     y = librosa.effects.preemphasis(y, coef=PREEMPH)
+
+    # 正規化
     peak = np.max(np.abs(y)) if y.size else 0.0
     if peak > 1e-6:
         y = 0.98 * y / peak
-    return y
+    return y.astype(np.float32)
+
+
 
 
 def bandpass_torch(
@@ -325,11 +345,16 @@ def bandpass_torch(
 ) -> torch.Tensor:
     y = torchaudio.functional.highpass_biquad(wav_t, sample_rate=sr, cutoff_freq=hpf_hz)
     y = torchaudio.functional.lowpass_biquad(y, sample_rate=sr, cutoff_freq=lpf_hz)
-    with torch.no_grad():
-        peak = y.abs().amax()
-        if torch.isfinite(peak) and peak > 1e-6:
-            y = y * (0.98 / peak)
+
+    # NaN/Inf ガード
+    if not torch.isfinite(y).all():
+        print("WARNING: NaN detected in bandpass, applying nan_to_num")
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+
     return y
+
+
+
 
 
 def ctc_greedy_decode(emission, labels, blank_id: int) -> str:

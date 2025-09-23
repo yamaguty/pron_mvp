@@ -22,6 +22,7 @@ ENV HF_HOME=/models/hf \
 TORCH_HOME=/models/torch \
 TOKENIZERS_PARALLELISM=false \
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+ASR_MODEL_ID=patrickvonplaten/wavlm-libri-clean-100h-base-plus \
 USE_PHONEME_BACKEND=true \
 PHONEME_MODEL=facebook/wav2vec2-lv-60-espeak-cv-ft
 

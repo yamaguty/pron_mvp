@@ -5,6 +5,7 @@ import numpy as np
 import soundfile as sf
 import librosa
 import torch, torchaudio
+from transformers import AutoModelForCTC, AutoProcessor
 from fastapi import FastAPI
 from pydantic import BaseModel
 from phonemizer import phonemize
@@ -28,17 +29,86 @@ ENERGY_FLOOR_GAIN = float(os.getenv("ENERGY_FLOOR_GAIN", "1.2"))
 ENERGY_W_MIN = float(os.getenv("ENERGY_W_MIN", "0.1"))
 ENERGY_MASK = os.getenv("ENERGY_MASK", "true").lower() == "true"
 
+_ASR_DEVICE_STR = os.getenv("ASR_DEVICE", "cpu")
+try:
+    ASR_DEVICE = torch.device(_ASR_DEVICE_STR)
+except (TypeError, RuntimeError):
+    ASR_DEVICE = torch.device("cpu")
+
+DEFAULT_WAVLM_ASR_MODEL = os.getenv(
+    "DEFAULT_WAVLM_ASR_MODEL", "patrickvonplaten/wavlm-libri-clean-100h-base-plus"
+)
+ASR_MODEL_ID = (
+    os.getenv("ASR_MODEL_ID", os.getenv("WAVLM_MODEL_ID", DEFAULT_WAVLM_ASR_MODEL))
+    .strip()
+    or DEFAULT_WAVLM_ASR_MODEL
+)
+ASR_BACKEND = "wavlm-ctc"
+HF_AUTH_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+
+
+def token_to_char(token: str) -> str:
+    if not token:
+        return ""
+    if token in {"<pad>", "<s>", "</s>", "<unk>", "<mask>"}:
+        return ""
+    if token in {"|", "▁", " "}:
+        return "|"
+    if len(token) == 1 and token.isalpha():
+        return token.upper()
+    if token.startswith("▁") and len(token) == 2 and token[1].isalpha():
+        return token[1].upper()
+    return ""
+
 if not USE_PHONEME:
-    BUNDLE = torchaudio.pipelines.WAV2VEC2_ASR_BASE_960H
-    ASR_MODEL = BUNDLE.get_model().eval()
-    LABELS = BUNDLE.get_labels()
-    BLANK_ID = 0  # torchaudio W2V2 CTC の blank
-    CHAR_TO_ID = {c: i for i, c in enumerate(LABELS)}
+    if not ASR_MODEL_ID:
+        raise RuntimeError("ASR_MODEL_ID must be set to a WavLM Base+ model identifier")
+    try:
+        hf_kwargs = {"token": HF_AUTH_TOKEN} if HF_AUTH_TOKEN else {}
+        ASR_PROCESSOR = AutoProcessor.from_pretrained(ASR_MODEL_ID, **hf_kwargs)
+        ASR_MODEL = AutoModelForCTC.from_pretrained(ASR_MODEL_ID, **hf_kwargs)
+        ASR_MODEL.to(ASR_DEVICE).eval()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"Failed to load WavLM model '{ASR_MODEL_ID}'. "
+            "Ensure the identifier is correct and, if required, provide an HF token."
+        ) from exc
+
+    vocab = ASR_PROCESSOR.tokenizer.get_vocab()
+    id_to_token = {idx: tok for tok, idx in vocab.items()}
+    if not id_to_token:
+        raise RuntimeError("Failed to load vocabulary from WavLM model")
+    vocab_size = max(id_to_token.keys()) + 1
+    LABELS = ["" for _ in range(vocab_size)]
+    for idx, token in id_to_token.items():
+        LABELS[idx] = token_to_char(token)
+    BLANK_ID = ASR_PROCESSOR.tokenizer.pad_token_id
+    if BLANK_ID is None:
+        BLANK_ID = ASR_PROCESSOR.tokenizer.word_delimiter_token_id
+    if BLANK_ID is None:
+        raise RuntimeError("Tokenizer must define a pad token to serve as the CTC blank")
+    CHAR_TO_ID = {}
+    for idx, char in enumerate(LABELS):
+        if char and char not in CHAR_TO_ID:
+            CHAR_TO_ID[char] = idx
 else:
     from phoneme_backend import PhonemeAligner
 
     PHONEME_MODEL = os.getenv("PHONEME_MODEL", "facebook/wav2vec2-lv-60-espeak-cv-ft")
     ALIGNER = PhonemeAligner(model_id=PHONEME_MODEL)
+
+
+def compute_asr_emission(wav_t: torch.Tensor) -> torch.Tensor:
+    if USE_PHONEME:
+        raise RuntimeError("Character backend is disabled; no ASR emission available")
+    if ASR_PROCESSOR is None:
+        raise RuntimeError("ASR processor is not initialized")
+    x = wav_t.squeeze(0).detach().cpu().numpy()
+    inputs = ASR_PROCESSOR(x, sampling_rate=16000, return_tensors="pt")
+    inputs = {k: v.to(ASR_DEVICE) for k, v in inputs.items()}
+    with torch.inference_mode():
+        logits = ASR_MODEL(**inputs).logits
+    return torch.log_softmax(logits, dim=-1).squeeze(0).cpu()
 
 with open(os.path.join(os.path.dirname(__file__), "presets.json"), "r") as f:
     PRESETS = json.load(f)
@@ -58,10 +128,8 @@ def warmup():
     x = np.zeros(sr, dtype=np.float32)
     wav = torch.from_numpy(x).unsqueeze(0)
     if not USE_PHONEME:
-        with torch.inference_mode():
-            emission, _ = ASR_MODEL(wav)  # (T,V)
-            emission = emission.log_softmax(-1).squeeze(0)
-        return {"ok": True, "backend": "char-ctc", "V": int(emission.size(-1))}
+        emission = compute_asr_emission(wav)
+        return {"ok": True, "backend": ASR_BACKEND, "V": int(emission.size(-1))}
     else:
         em = ALIGNER.emission(wav)
         return {"ok": True, "backend": "phoneme-ctc", "V": int(em.size(-1))}
@@ -133,10 +201,8 @@ def score(inp: ScoreIn):
             },
         }
 
-    # -------- 高速モード（文字CTC→IPA近似） --------
-    with torch.inference_mode():
-        emission, _ = ASR_MODEL(wav_t)  # (emission, lengths)
-        emission = emission.log_softmax(-1).squeeze(0)  # (T, V)
+    # -------- 高速モード（ASR CTC→IPA近似） --------
+    emission = compute_asr_emission(wav_t)
 
     # 短時間RMSに基づくフレーム重み（教室ガヤ対策）
     weights = None
@@ -188,7 +254,11 @@ def score(inp: ScoreIn):
     ratio = wav_t.size(1) / emission.size(0)  # samples_per_frame
     char_segments = []
     for s, e, tid in spans:
+        if tid >= len(LABELS):
+            continue
         ch = LABELS[tid]
+        if not ch:
+            continue
         start = s * ratio / 16000.0
         end = e * ratio / 16000.0
         if ENERGY_WEIGHTING and weights is not None:
@@ -279,7 +349,8 @@ def score(inp: ScoreIn):
         "diagnostics": {
             "latency_ms": int((time.time() - t0) * 1000),
             "frames": int(emission.size(0)),
-            "backend": "char-ctc",
+            "backend": ASR_BACKEND,
+            "model_id": ASR_MODEL_ID,
             "sim": float(sim),
             "hyp": hyp_raw,
             "penalty": float(penalty),
@@ -365,7 +436,14 @@ def ctc_greedy_decode(emission, labels, blank_id: int) -> str:
         if i == blank_id or i == last:
             last = i
             continue
-        out.append(labels[i])
+        if i >= len(labels):
+            last = i
+            continue
+        ch = labels[i]
+        if not ch:
+            last = i
+            continue
+        out.append(ch)
         last = i
     return "".join(out)
 

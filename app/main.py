@@ -1,6 +1,6 @@
 from __future__ import annotations
-import os, time, json, re
-from typing import List, Dict
+import os, time, json, re, pprint
+from typing import List, Dict, Literal, Optional
 import numpy as np
 import soundfile as sf
 import librosa
@@ -17,9 +17,9 @@ APP = FastAPI(title="pron-mvp")
 app = APP  # uvicorn main:app 用
 
 USE_PHONEME = os.getenv("USE_PHONEME_BACKEND", "false").lower() == "true"
-SIM_THRESH = float(os.getenv("REJECT_SIM_THRESH", "0.4"))  # 類似度しきい値（0~1）
-NOISE_ROBUST = os.getenv("NOISE_ROBUST", "true").lower() == "true"
-TRIM_RATIO = float(os.getenv("TRIM_RATIO", "0.1"))  # トリム平均率 0~0.4 目安0.1
+SIM_THRESH = float(os.getenv("REJECT_SIM_THRESH", "0.25"))  # 類似度しきい値（0~1）
+NOISE_ROBUST = os.getenv("NOISE_ROBUST", "true").lower() == "false"
+TRIM_RATIO = float(os.getenv("TRIM_RATIO", "0.05"))  # トリム平均率 0~0.4 目安0.1
 HPF_HZ = float(os.getenv("HPF_HZ", "20"))
 LPF_HZ = float(os.getenv("LPF_HZ", "7900"))
 PREEMPH = float(os.getenv("PREEMPH", "0.95"))
@@ -28,6 +28,14 @@ ENERGY_PCTL = float(os.getenv("ENERGY_PCTL", "0.2"))  # 下位分位点（0~1）
 ENERGY_FLOOR_GAIN = float(os.getenv("ENERGY_FLOOR_GAIN", "1.2"))
 ENERGY_W_MIN = float(os.getenv("ENERGY_W_MIN", "0.1"))
 ENERGY_MASK = os.getenv("ENERGY_MASK", "true").lower() == "true"
+
+# 短い単語/フレーズ用の設定
+SHORT_WORD_BOOST = float(os.getenv("SHORT_WORD_BOOST", "1.7"))  # 短い単語のスコアブースト
+MIN_WORD_LENGTH = int(os.getenv("MIN_WORD_LENGTH", "8"))  # この文字数以下を短いとする
+MIN_PHONE_SCORE = float(os.getenv("MIN_PHONE_SCORE", "10"))  # 音素の最低スコア
+WORD_MODE_PENALTY_SCALE = float(os.getenv("WORD_MODE_PENALTY_SCALE", "0.35"))  # wordモードでのペナルティ緩和
+WORD_MODE_MIN_BASE = float(os.getenv("WORD_MODE_MIN_BASE", "12"))  # wordモード最低保証
+WORD_MODE_NO_MATCH_SIM = float(os.getenv("WORD_MODE_NO_MATCH_SIM", "0.1"))  # hypがかすらない判定
 
 # Words allowed to miss without triggering zero-score penalties
 ZERO_SCORE_WORD_WHITELIST = {
@@ -133,7 +141,138 @@ SEP = Separator(phone=" ", word="|", syllable="")
 class ScoreIn(BaseModel):
     text: str = "This is a test."
     preset: str = "adult"  # elem|junior|high|adult
-    audio_path: str | None = None  # 未指定なら /data/samples/sample.wav
+    mode: Literal["word", "sentence"] = "sentence"  # word or sentence mode
+    audio_path: Optional[str] = None  # 未指定なら /data/samples/sample.wav
+
+
+def pretty_print_response(label: str, payload: Dict) -> None:
+    """Print the response payload in a readable format for debugging."""
+    try:
+        formatted = json.dumps(payload, ensure_ascii=False, indent=2)
+    except TypeError:
+        formatted = pprint.pformat(payload, indent=2, width=120, compact=False)
+    print(f"{label}:\n{formatted}", flush=True)
+
+
+def adjust_preset_for_mode(preset: dict, mode: str, text_length: int) -> dict:
+    """モードとテキスト長に応じてプリセットを調整"""
+    adjusted = preset.copy()
+    
+    if mode == "word" or text_length <= MIN_WORD_LENGTH:
+        # wordモードまたは短いテキストの場合、より寛容な設定に
+        adjusted["tau"] = preset.get("tau", 2.5) * 1.45  # 閾値をさらに下げる
+        adjusted["beta"] = preset.get("beta", 0.6) * 1.3  # 曲線をさらに緩やかに
+    
+    return adjusted
+
+
+def compute_energy_weights_adaptive(
+    wav_t: torch.Tensor, 
+    emission: torch.Tensor, 
+    mode: str
+) -> Optional[torch.Tensor]:
+    """モードに応じてエネルギー重み付けを計算"""
+    if not ENERGY_WEIGHTING:
+        return None
+    
+    T = int(emission.size(0))
+    n_samples = int(wav_t.size(1))
+    samples_per_frame = max(1, n_samples // max(1, T))
+    
+    x = wav_t.squeeze(0).detach().cpu().numpy()
+    rms = []
+    
+    for i in range(T):
+        s = i * samples_per_frame
+        e = min(n_samples, s + samples_per_frame)
+        seg = x[s:e]
+        if seg.size == 0:
+            rms.append(0.0)
+        else:
+            rms.append(float(np.sqrt(np.mean(seg * seg))))
+    
+    rms = np.asarray(rms, dtype=np.float32)
+    
+    # wordモードの場合は異なる閾値設定
+    if mode == "word":
+        p = max(0.05, ENERGY_PCTL * 0.5)  # より低いパーセンタイル
+        floor = np.percentile(rms, p * 100.0)
+        thr = max(0.01, float(floor) * 1.0)  # より低い閾値
+        min_w = 0.3  # より高い最小重み
+    else:
+        p = np.clip(ENERGY_PCTL, 0.0, 1.0)
+        floor = np.percentile(rms, p * 100.0)
+        thr = max(0.02, float(floor) * ENERGY_FLOOR_GAIN)
+        min_w = ENERGY_W_MIN
+    
+    weights = rms - thr
+    weights[weights < 0] = 0.0
+    
+    if weights.max() > 0:
+        weights = weights / (weights.max() + 1e-8)
+    
+    weights = np.maximum(weights, min_w)
+    
+    if ENERGY_MASK and mode == "sentence":
+        # sentenceモードの場合のみマスクを適用
+        weights = np.where(rms >= thr, weights, 0.0)
+    
+    return torch.from_numpy(weights).float()
+
+
+def preprocess_wav_adaptive(
+    wav: np.ndarray, 
+    sr: int, 
+    mode: str
+) -> np.ndarray:
+    """モードに応じた前処理"""
+    if mode == "word":
+        # wordモードの場合はより緩いトリミング
+        y, _ = librosa.effects.trim(wav, top_db=30)
+        preemph_coef = 0.9  # より弱いプリエンファシス
+    else:
+        y, _ = librosa.effects.trim(wav, top_db=20)
+        preemph_coef = PREEMPH
+    
+    # トリムで空 or 短すぎる場合は元の波形を使う
+    min_duration = 0.2 if mode == "word" else 0.3
+    if y.size == 0 or len(y) < int(min_duration * sr):
+        y = wav
+    
+    # プリエンファシス
+    y = librosa.effects.preemphasis(y, coef=preemph_coef)
+    
+    # 正規化
+    peak = np.max(np.abs(y)) if y.size else 0.0
+    if peak > 1e-6:
+        y = 0.98 * y / peak
+    
+    return y.astype(np.float32)
+
+
+def adaptive_bandpass(
+    wav_t: torch.Tensor, 
+    sr: int, 
+    mode: str
+) -> torch.Tensor:
+    """モードに応じたバンドパスフィルタ"""
+    if mode == "word":
+        # wordモードの場合はより広い周波数帯を保持
+        hpf = 10
+        lpf = 8000
+    else:
+        hpf = HPF_HZ
+        lpf = LPF_HZ
+    
+    y = torchaudio.functional.highpass_biquad(wav_t, sample_rate=sr, cutoff_freq=hpf)
+    y = torchaudio.functional.lowpass_biquad(y, sample_rate=sr, cutoff_freq=lpf)
+    
+    # NaN/Inf ガード
+    if not torch.isfinite(y).all():
+        print("WARNING: NaN detected in bandpass, applying nan_to_num")
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    return y
 
 
 @APP.get("/warmup")
@@ -153,35 +292,44 @@ def warmup():
 def score(inp: ScoreIn):
     t0 = time.time()
     audio_path = inp.audio_path or "/data/samples/sample.wav"
+    mode = inp.mode  # word or sentence
+    
+    # デバッグ情報
+    print(f"Processing in {mode} mode for text: '{inp.text}'", flush=True)
+    
     wav, sr = sf.read(audio_path)
     if sr != 16000:
         wav = librosa.resample(wav.astype(np.float32), orig_sr=sr, target_sr=16000)
         sr = 16000
     if wav.ndim > 1:
         wav = np.mean(wav, axis=1)
+    
     if NOISE_ROBUST:
-        wav = preprocess_wav_np(wav, sr)
-        print("DEBUG preprocess: len=", len(wav), 
+        wav = preprocess_wav_adaptive(wav, sr, mode)
+        print(f"DEBUG preprocess ({mode} mode): len=", len(wav), 
             "dtype=", wav.dtype, 
             "RMS=", float(np.sqrt(np.mean(wav**2))) if wav.size else 0.0, flush=True)
 
     wav_t = torch.from_numpy(wav).float().unsqueeze(0)
 
     if NOISE_ROBUST:
-        wav_t = bandpass_torch(wav_t, sr=16000, hpf_hz=HPF_HZ, lpf_hz=LPF_HZ)
-        print("DEBUG bandpass: shape=", tuple(wav_t.shape),
+        wav_t = adaptive_bandpass(wav_t, sr=16000, mode=mode)
+        print(f"DEBUG bandpass ({mode} mode): shape=", tuple(wav_t.shape),
             "RMS=", float(wav_t.pow(2).mean().sqrt().item()),
             "min=", float(wav_t.min().item()),
             "max=", float(wav_t.max().item()), flush=True)
 
-
+    # テキスト長に基づくプリセット調整
+    text_length = len(inp.text.replace(" ", ""))
     preset = PRESETS.get(inp.preset, PRESETS["adult"])
+    preset = adjust_preset_for_mode(preset, mode, text_length)
+    
     text_words = text_to_words(inp.text)
 
     if USE_PHONEME:
         # -------- IPA厳密モード --------
         phones_ipa = ALIGNER.align(wav_t, inp.text)  # [{p,start,end,logp}]
-        phone_like = phones_to_scores(phones_ipa, preset)
+        phone_like = phones_to_scores(phones_ipa, preset, mode)
 
         # 単語ごとの音素配列（phonemizerで正解側の分割を取得）
         ipa_str = phonemize(
@@ -201,61 +349,39 @@ def score(inp: ScoreIn):
             for w in words_scored
             if not (w["score"] == 0 and w.get("whitelisted"))
         ]
-        overall = int(
-            np.clip(
-                np.mean(scores_for_mean) if scores_for_mean else 0,
-                0,
-                100,
-            )
+        
+        # モードに応じた全体スコア計算
+        base_overall = float(
+            np.clip(np.mean(scores_for_mean) if scores_for_mean else 0, 0, 100)
         )
-        return {
+        
+        if mode == "word" and base_overall < 20 and text_length <= MIN_WORD_LENGTH:
+            base_overall = 20  # wordモードの最低保証
+        
+        overall = int(base_overall)
+        
+        result = {
             "overall": overall,
             "preset": inp.preset,
-            "words": words_scored,  # ← 追加（単語スコア）
+            "mode": mode,
+            "words": words_scored,
             "chars": [],  # phoneme-CTCでは文字整列は省略
             "phones": phone_like[:1000],
             "diagnostics": {
                 "latency_ms": int((time.time() - t0) * 1000),
                 "backend": "phoneme-ctc",
+                "mode": mode,
             },
         }
+
+        pretty_print_response("/score result", result)
+        return result
 
     # -------- 高速モード（ASR CTC→IPA近似） --------
     emission = compute_asr_emission(wav_t)
 
-    # 短時間RMSに基づくフレーム重み（教室ガヤ対策）
-    weights = None
-    if ENERGY_WEIGHTING:
-        # emissionの時間長Tに合わせた窓で音声RMSを計算
-        T = int(emission.size(0))
-        n_samples = int(wav_t.size(1))
-        # サンプル/フレーム比
-        samples_per_frame = max(1, n_samples // max(1, T))
-        x = wav_t.squeeze(0).detach().cpu().numpy()
-        rms = []
-        for i in range(T):
-            s = i * samples_per_frame
-            e = min(n_samples, s + samples_per_frame)
-            seg = x[s:e]
-            if seg.size == 0:
-                rms.append(0.0)
-            else:
-                rms.append(float(np.sqrt(np.mean(seg * seg))))
-        rms = np.asarray(rms, dtype=np.float32)
-        # 動的ノイズ床（下位分位点）
-        p = np.clip(ENERGY_PCTL, 0.0, 1.0)
-        floor = np.percentile(rms, p * 100.0)
-        thr = max(0.02, float(floor) * ENERGY_FLOOR_GAIN)
-        # 正規化重み
-        weights = rms - thr
-        weights[weights < 0] = 0.0
-        if weights.max() > 0:
-            weights = weights / (weights.max() + 1e-8)
-        weights = np.maximum(weights, ENERGY_W_MIN)
-        if ENERGY_MASK:
-            # しきい値未満は完全に無視
-            weights = np.where(rms >= thr, weights, 0.0)
-        weights = torch.from_numpy(weights).to(emission.device).float()  # (T,)
+    # エネルギー重み付け（モード対応）
+    weights = compute_energy_weights_adaptive(wav_t, emission, mode)
 
     # 類似度（後段の全体減点に使用）
     hyp_raw = ctc_greedy_decode(emission, LABELS, BLANK_ID)
@@ -280,8 +406,8 @@ def score(inp: ScoreIn):
             continue
         start = s * ratio / 16000.0
         end = e * ratio / 16000.0
-        if ENERGY_WEIGHTING and weights is not None:
-            # 重み付き平均（wは時間のみ依存）
+        if weights is not None:
+            # 重み付き平均
             w = weights[s:e]
             vals = emission[s:e, tid]
             if w.numel() > 0 and float(w.sum().item()) > 0:
@@ -307,9 +433,8 @@ def score(inp: ScoreIn):
     # 単語区間（char_segments の '|' を境界に）
     word_spans = word_spans_from_chars(char_segments)
 
-    # 近似: 各単語区間を、その単語の音素数で等分して phone 区間を作る→採点
+    # 近似: 各単語区間を、その単語の音素数で等分してphone区間を作る→採点
     phone_like = []
-    approx_idx = 0
     for i, (ws, we) in enumerate(word_spans):
         phones = ipa_words[i] if i < len(ipa_words) else []
         if not phones:
@@ -321,8 +446,12 @@ def score(inp: ScoreIn):
         for p in phones:
             approx.append({"p": p, "start": cur, "end": cur + step})
             cur += step
-        scored = score_phones_from_chars(emission, approx, char_segments, preset)
+        
         word_label = text_words[i] if i < len(text_words) else f"word{i+1}"
+        scored = score_phones_from_chars(
+            emission, approx, char_segments, preset, mode, word_label
+        )
+        
         is_whitelisted = is_whitelisted_zero_word(word_label)
         for sc in scored:
             sc["word"] = word_label
@@ -341,39 +470,101 @@ def score(inp: ScoreIn):
         np.clip(np.mean(scores_for_mean) if scores_for_mean else 0, 0, 100)
     )
 
-    # 構造・不一致に基づく全体減点（部分一致の単語スコアは保持）
+    # モードに応じたペナルティ計算
     penalty = 1.0
-    # 類似度がしきい値未満なら二乗で強めに減点
-    if len(hyp) == 0:
-        penalty *= 0.3
-    elif sim < SIM_THRESH:
-        penalty *= max(0.0, (sim / SIM_THRESH)) ** 2
-    # 単語数の構造差（文字ベース境界 vs 期待単語数）
-    struct_diff = 0.0
-    try:
-        struct_diff = abs(len(word_spans) - len(text_words)) / max(1, len(text_words))
-    except Exception:
+    
+    if mode == "word":
+        # wordモードの場合はペナルティを緩和
+        filtered_phones = [p for p in phone_like if not p.get("whitelisted")]
+        has_phone_partial = any(p.get("score", 0) > 0 for p in filtered_phones)
+
+        if len(hyp) == 0 and not has_phone_partial:
+            penalty = 0.0
+        elif sim < SIM_THRESH and not has_phone_partial:
+            # 類似度が低い場合は線形にペナルティ（音素部分点がなければゼロへ収束）
+            denom = SIM_THRESH if SIM_THRESH > 1e-6 else 1.0
+            similarity_scale = max(0.0, min(1.0, sim / denom))
+            penalty *= similarity_scale
+        
+        # 構造差のペナルティも緩和
         struct_diff = 0.0
-    penalty *= max(0.4, 1.0 - 0.8 * struct_diff)
-    # phoneレベルで0点が多い場合はさらに減点
-    zero_phone_rate = 0.0
-    filtered_phones = [p for p in phone_like if not p.get("whitelisted")]
-    if filtered_phones:
-        zero_phone_rate = sum(1 for p in filtered_phones if p.get("score", 0) == 0) / len(
-            filtered_phones
-        )
-        penalty *= max(0.3, 1.0 - 0.8 * zero_phone_rate)
-    # 単語の中に0点がある場合の固定減点（ホワイトリストは除外）
-    if any(
-        w.get("score", 0) == 0 and not w.get("whitelisted") for w in words_scored
+        try:
+            struct_diff = abs(len(word_spans) - len(text_words)) / max(1, len(text_words))
+        except Exception:
+            struct_diff = 0.0
+        penalty *= max(0.6, 1.0 - 0.5 * struct_diff)
+        
+        # 0点phoneの影響も緩和
+        zero_phone_rate = 0.0
+        if filtered_phones:
+            zero_phone_rate = sum(1 for p in filtered_phones if p.get("score", 0) == 0) / len(
+                filtered_phones
+            )
+            penalty *= max(0.5, 1.0 - 0.5 * zero_phone_rate)
+        
+        # 0点単語の影響も緩和
+        if any(
+            w.get("score", 0) == 0 and not w.get("whitelisted") for w in words_scored
+        ):
+            penalty *= 0.85
+
+        # hyp がかすりもしない場合は 0 点確定（音素部分点がある場合は除く）
+        no_hyp_match = len(hyp) == 0 or sim < WORD_MODE_NO_MATCH_SIM
+        if no_hyp_match and not has_phone_partial:
+            base_overall = 0.0
+            penalty = 0.0
+
+        # ペナルティを許容範囲に制限
+        penalty = max(0.0, min(penalty, 1.0))
+        if penalty > 0.0:
+            penalty = penalty ** WORD_MODE_PENALTY_SCALE
+        
+    else:
+        # sentenceモード（既存のロジック）
+        if len(hyp) == 0:
+            penalty *= 0.3
+        elif sim < SIM_THRESH:
+            penalty *= max(0.0, (sim / SIM_THRESH)) ** 2
+        
+        # 構造差
+        struct_diff = 0.0
+        try:
+            struct_diff = abs(len(word_spans) - len(text_words)) / max(1, len(text_words))
+        except Exception:
+            struct_diff = 0.0
+        penalty *= max(0.4, 1.0 - 0.8 * struct_diff)
+        
+        # phoneレベルで0点が多い場合
+        zero_phone_rate = 0.0
+        filtered_phones = [p for p in phone_like if not p.get("whitelisted")]
+        if filtered_phones:
+            zero_phone_rate = sum(1 for p in filtered_phones if p.get("score", 0) == 0) / len(
+                filtered_phones
+            )
+            penalty *= max(0.3, 1.0 - 0.8 * zero_phone_rate)
+        
+        # 単語の中に0点がある場合
+        if any(
+            w.get("score", 0) == 0 and not w.get("whitelisted") for w in words_scored
+        ):
+            penalty *= 0.6
+
+    # wordモードで短いテキストの場合、最低スコアを保証
+    if (
+        mode == "word"
+        and text_length <= MIN_WORD_LENGTH
+        and base_overall < WORD_MODE_MIN_BASE
+        and penalty > 0.5
     ):
-        penalty *= 0.6
+        base_overall = WORD_MODE_MIN_BASE
 
     overall = int(np.clip(base_overall * penalty, 0, 100))
-    return {
+    
+    result = {
         "overall": overall,
         "preset": inp.preset,
-        "words": words_scored,  # ← 追加（単語スコア）
+        "mode": mode,
+        "words": words_scored,
         "chars": char_segments[:1000],
         "phones": phone_like[:1000],
         "diagnostics": {
@@ -381,15 +572,17 @@ def score(inp: ScoreIn):
             "frames": int(emission.size(0)),
             "backend": ASR_BACKEND,
             "model_id": ASR_MODEL_ID,
+            "mode": mode,
             "sim": float(sim),
             "hyp": hyp_raw,
             "penalty": float(penalty),
-            "zero_phone_rate": float(zero_phone_rate),
-            "struct_diff": float(struct_diff),
+            "zero_phone_rate": float(zero_phone_rate) if 'zero_phone_rate' in locals() else 0.0,
+            "struct_diff": float(struct_diff) if 'struct_diff' in locals() else 0.0,
             "noise_reduction": bool(NOISE_ROBUST),
             "trim_ratio": float(TRIM_RATIO),
             "preemphasis": float(PREEMPH),
-            "bandpass": {"hpf_hz": float(HPF_HZ), "lpf_hz": float(LPF_HZ)},
+            "bandpass": {"hpf_hz": float(hpf) if 'hpf' in locals() else HPF_HZ, 
+                        "lpf_hz": float(lpf) if 'lpf' in locals() else LPF_HZ},
             "energy_weighting": bool(ENERGY_WEIGHTING),
             "energy_pctl": float(ENERGY_PCTL),
             "energy_floor_gain": float(ENERGY_FLOOR_GAIN),
@@ -397,6 +590,9 @@ def score(inp: ScoreIn):
             "energy_mask": bool(ENERGY_MASK),
         },
     }
+
+    pretty_print_response("/score result", result)
+    return result
 
 
 # ---- helpers ----
@@ -439,8 +635,6 @@ def preprocess_wav_np(wav: np.ndarray, sr: int) -> np.ndarray:
     return y.astype(np.float32)
 
 
-
-
 def bandpass_torch(
     wav_t: torch.Tensor, sr: int, hpf_hz: float, lpf_hz: float
 ) -> torch.Tensor:
@@ -453,9 +647,6 @@ def bandpass_torch(
         y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
 
     return y
-
-
-
 
 
 def ctc_greedy_decode(emission, labels, blank_id: int) -> str:
@@ -581,13 +772,41 @@ def words_from_phone_sequence(
     return out
 
 
-def score_phones_from_chars(emission, approx, char_segments, preset):
+def score_phones_from_chars(
+    emission, approx, char_segments, preset, mode="sentence", word_label=""
+):
+    """モードと単語に応じてスコアを計算"""
+    # 単語の長さに基づく調整
+    word_length = len(word_label) if word_label else 10
+    
     tau = preset["tau"]
     beta = preset["beta"]
+    
+    # wordモードまたは短い単語の場合の調整
+    if mode == "word" or word_length <= MIN_WORD_LENGTH:
+        tau = tau * 1.3  # 閾値をさらに緩める
+        beta = beta * 1.2  # 曲線をさらに緩やかに
 
     def to_score(logp):
         x = (logp - (-tau)) / beta
-        return float(100.0 / (1.0 + np.exp(-x)))
+        base_score = float(100.0 / (1.0 + np.exp(-x)))
+        
+        # wordモードまたは短い単語にブーストを適用
+        if mode == "word" or word_length <= MIN_WORD_LENGTH:
+            base_score = base_score * SHORT_WORD_BOOST
+
+        if mode == "word":
+            # Wordモードでは最低保証を強めに
+            if logp > -5.0 and base_score < MIN_PHONE_SCORE:
+                base_score = MIN_PHONE_SCORE
+        else:
+            # Sentenceモードでも軽い最低保証を追加
+            # → logp が検出できているのにスコアが極端に低い場合に救済
+            if logp > -5.0 and base_score < (MIN_PHONE_SCORE * 0.5):
+                base_score = MIN_PHONE_SCORE * 0.5
+
+        return base_score
+
 
     scored = []
     for ph in approx:
@@ -597,7 +816,14 @@ def score_phones_from_chars(emission, approx, char_segments, preset):
             ov = max(0.0, min(e, ch["end"]) - max(s, ch["start"]))
             if ov > 0:
                 vals.append(ch["logp"])
-        lp = float(trimmed_mean(vals, TRIM_RATIO)) if vals else -5.0
+        
+        # 値が取得できない場合のデフォルト値を調整
+        if not vals:
+            # wordモードの場合はより寛容なデフォルト値
+            lp = -3.0 if mode == "word" else -5.0
+        else:
+            lp = float(trimmed_mean(vals, TRIM_RATIO))
+        
         scored.append(
             {
                 "p": ph["p"],
@@ -609,13 +835,26 @@ def score_phones_from_chars(emission, approx, char_segments, preset):
     return scored
 
 
-def phones_to_scores(phones_ipa, preset):
+def phones_to_scores(phones_ipa, preset, mode="sentence"):
+    """phoneme-CTC用のスコア計算（モード対応）"""
     tau = preset["tau"]
     beta = preset["beta"]
+    
+    # wordモードの調整
+    if mode == "word":
+        tau = tau * 1.3
+        beta = beta * 1.2
 
     def to_score(logp):
         x = (logp - (-tau)) / beta
-        return float(100.0 / (1.0 + np.exp(-x)))
+        base_score = float(100.0 / (1.0 + np.exp(-x)))
+        
+        if mode == "word":
+            base_score = base_score * SHORT_WORD_BOOST
+            if logp > -5.0 and base_score < MIN_PHONE_SCORE:
+                base_score = MIN_PHONE_SCORE
+        
+        return base_score
 
     out = []
     for ph in phones_ipa:

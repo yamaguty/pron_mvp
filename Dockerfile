@@ -30,6 +30,12 @@ PHONEME_MODEL=facebook/wav2vec2-lv-60-espeak-cv-ft
 WORKDIR /app
 COPY app /app
 
+# 環境変数の設定（短い単語対応）
+ENV SHORT_WORD_BOOST=1.5
+ENV MIN_WORD_LENGTH=8
+ENV MIN_PHONE_SCORE=15
+ENV WORD_MODE_PENALTY_SCALE=0.5
+
 
 VOLUME ["/data", "/models"]
 EXPOSE 8000

@@ -1,12 +1,13 @@
 from __future__ import annotations
 import os, time, json, re, pprint
+from pathlib import Path
 from typing import List, Dict, Literal, Optional
 import numpy as np
 import soundfile as sf
 import librosa
 import torch, torchaudio
 from transformers import AutoModelForCTC, AutoProcessor
-from fastapi import FastAPI
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from phonemizer import phonemize
 from phonemizer.separator import Separator
@@ -28,6 +29,10 @@ ENERGY_PCTL = float(os.getenv("ENERGY_PCTL", "0.2"))  # 下位分位点（0~1）
 ENERGY_FLOOR_GAIN = float(os.getenv("ENERGY_FLOOR_GAIN", "1.2"))
 ENERGY_W_MIN = float(os.getenv("ENERGY_W_MIN", "0.1"))
 ENERGY_MASK = os.getenv("ENERGY_MASK", "true").lower() == "true"
+
+UPLOAD_DATA_DIR = Path(os.getenv("UPLOAD_DATA_DIR", "/data")).expanduser()
+_allowed_ips_env = os.getenv("UPLOAD_ALLOWED_IPS", "")
+UPLOAD_ALLOWED_IPS = {ip.strip() for ip in _allowed_ips_env.split(",") if ip.strip()}
 
 # 短い単語/フレーズ用の設定
 SHORT_WORD_BOOST = float(os.getenv("SHORT_WORD_BOOST", "1.7"))  # 短い単語のスコアブースト
@@ -154,6 +159,15 @@ def pretty_print_response(label: str, payload: Dict) -> None:
     print(f"{label}:\n{formatted}", flush=True)
 
 
+def get_client_ip(request: Request) -> Optional[str]:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return None
+
+
 def adjust_preset_for_mode(preset: dict, mode: str, text_length: int) -> dict:
     """モードとテキスト長に応じてプリセットを調整"""
     adjusted = preset.copy()
@@ -273,6 +287,47 @@ def adaptive_bandpass(
         y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
     
     return y
+
+
+@APP.post("/upload")
+async def upload_file(request: Request, file: UploadFile = File(...)):
+    client_ip = get_client_ip(request)
+    if UPLOAD_ALLOWED_IPS and (client_ip is None or client_ip not in UPLOAD_ALLOWED_IPS):
+        raise HTTPException(status_code=403, detail="Uploads are not permitted from this IP address.")
+
+    safe_name = Path(file.filename or "").name
+    if not safe_name:
+        await file.close()
+        raise HTTPException(status_code=400, detail="A valid filename is required.")
+
+    try:
+        UPLOAD_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        await file.close()
+        raise HTTPException(status_code=500, detail=f"Failed to prepare upload directory: {exc}")
+
+    destination = UPLOAD_DATA_DIR / safe_name
+    bytes_written = 0
+
+    try:
+        with destination.open("wb") as buffer:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                buffer.write(chunk)
+                bytes_written += len(chunk)
+    except OSError as exc:
+        await file.close()
+        raise HTTPException(status_code=500, detail=f"Failed to write upload: {exc}")
+    finally:
+        await file.close()
+
+    return {
+        "filename": safe_name,
+        "bytes_written": bytes_written,
+        "path": str(destination),
+    }
 
 
 @APP.get("/warmup")

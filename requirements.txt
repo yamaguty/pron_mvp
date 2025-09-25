@@ -1,0 +1,22 @@
+# CPU 版 PyTorch + torchaudio
+torch==2.3.1
+torchaudio==2.3.1
+
+# Web API 本体
+fastapi
+uvicorn[standard]
+
+# 数値・音声処理
+numpy
+scipy
+librosa
+soundfile
+phonemizer
+
+# NLP 系
+transformers==4.44.2
+
+# 型・バリデーション
+pydantic==2.8.2
+
+python-multipart

@@ -2,7 +2,7 @@ FROM public.ecr.aws/docker/library/python:3.11-slim
 
 # === OS / ランタイム依存 ===
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsndfile1 ffmpeg ca-certificates && \
+    libsndfile1 ffmpeg ca-certificates espeak-ng espeak-ng-data && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

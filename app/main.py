@@ -8,6 +8,7 @@ import librosa
 import torch, torchaudio
 from transformers import AutoModelForCTC, AutoProcessor
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from phonemizer import phonemize
 from phonemizer.separator import Separator
@@ -16,6 +17,14 @@ import difflib  # 類似度計算
 
 APP = FastAPI(title="pron-mvp")
 app = APP  # uvicorn main:app 用
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 開発中は["*"]でも可
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 USE_PHONEME = os.getenv("USE_PHONEME_BACKEND", "false").lower() == "true"
 SIM_THRESH = float(os.getenv("REJECT_SIM_THRESH", "0.25"))  # 類似度しきい値（0~1）
@@ -30,7 +39,11 @@ ENERGY_FLOOR_GAIN = float(os.getenv("ENERGY_FLOOR_GAIN", "1.2"))
 ENERGY_W_MIN = float(os.getenv("ENERGY_W_MIN", "0.1"))
 ENERGY_MASK = os.getenv("ENERGY_MASK", "true").lower() == "true"
 
-UPLOAD_DATA_DIR = Path(os.getenv("UPLOAD_DATA_DIR", "/data")).expanduser()
+def _is_cloud_run() -> bool:
+    return any(os.getenv(k) for k in ("K_SERVICE", "K_REVISION", "K_CONFIGURATION"))
+
+_DEFAULT_UPLOAD_DIR = "/tmp" if _is_cloud_run() else "/data"
+UPLOAD_DATA_DIR = Path(os.getenv("UPLOAD_DATA_DIR", _DEFAULT_UPLOAD_DIR)).expanduser()
 _allowed_ips_env = os.getenv("UPLOAD_ALLOWED_IPS", "")
 UPLOAD_ALLOWED_IPS = {ip.strip() for ip in _allowed_ips_env.split(",") if ip.strip()}
 

@@ -48,9 +48,9 @@ _allowed_ips_env = os.getenv("UPLOAD_ALLOWED_IPS", "")
 UPLOAD_ALLOWED_IPS = {ip.strip() for ip in _allowed_ips_env.split(",") if ip.strip()}
 
 # 短い単語/フレーズ用の設定
-SHORT_WORD_BOOST = float(os.getenv("SHORT_WORD_BOOST", "1.7"))  # 短い単語のスコアブースト
+SHORT_WORD_BOOST = float(os.getenv("SHORT_WORD_BOOST", "1.5"))  # 短い単語のスコアブースト
 MIN_WORD_LENGTH = int(os.getenv("MIN_WORD_LENGTH", "8"))  # この文字数以下を短いとする
-MIN_PHONE_SCORE = float(os.getenv("MIN_PHONE_SCORE", "10"))  # 音素の最低スコア
+MIN_PHONE_SCORE = float(os.getenv("MIN_PHONE_SCORE", "5"))  # 音素の最低スコア
 WORD_MODE_PENALTY_SCALE = float(os.getenv("WORD_MODE_PENALTY_SCALE", "0.35"))  # wordモードでのペナルティ緩和
 WORD_MODE_MIN_BASE = float(os.getenv("WORD_MODE_MIN_BASE", "12"))  # wordモード最低保証
 WORD_MODE_NO_MATCH_SIM = float(os.getenv("WORD_MODE_NO_MATCH_SIM", "0.1"))  # hypがかすらない判定
@@ -187,8 +187,8 @@ def adjust_preset_for_mode(preset: dict, mode: str, text_length: int) -> dict:
     
     if mode == "word" or text_length <= MIN_WORD_LENGTH:
         # wordモードまたは短いテキストの場合、より寛容な設定に
-        adjusted["tau"] = preset.get("tau", 2.5) * 1.45  # 閾値をさらに下げる
-        adjusted["beta"] = preset.get("beta", 0.6) * 1.3  # 曲線をさらに緩やかに
+        adjusted["tau"] = preset.get("tau", 2.5) * 1.1  # 閾値をさらに下げる
+        adjusted["beta"] = preset.get("beta", 0.6) * 1.4  # 曲線をさらに緩やかに
     
     return adjusted
 
@@ -305,8 +305,8 @@ def adaptive_bandpass(
 @APP.post("/upload")
 async def upload_file(request: Request, file: UploadFile = File(...)):
     client_ip = get_client_ip(request)
-    if UPLOAD_ALLOWED_IPS and (client_ip is None or client_ip not in UPLOAD_ALLOWED_IPS):
-        raise HTTPException(status_code=403, detail="Uploads are not permitted from this IP address.")
+    # if UPLOAD_ALLOWED_IPS and (client_ip is None or client_ip not in UPLOAD_ALLOWED_IPS):
+    #     raise HTTPException(status_code=403, detail="Uploads are not permitted from this IP address.")
 
     safe_name = Path(file.filename or "").name
     if not safe_name:

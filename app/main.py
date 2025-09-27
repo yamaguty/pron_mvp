@@ -54,9 +54,10 @@ MIN_PHONE_SCORE = float(os.getenv("MIN_PHONE_SCORE", "5"))  # 音素の最低ス
 WORD_MODE_PENALTY_SCALE = float(os.getenv("WORD_MODE_PENALTY_SCALE", "0.35"))  # wordモードでのペナルティ緩和
 WORD_MODE_MIN_BASE = float(os.getenv("WORD_MODE_MIN_BASE", "12"))  # wordモード最低保証
 WORD_MODE_NO_MATCH_SIM = float(os.getenv("WORD_MODE_NO_MATCH_SIM", "0.1"))  # hypがかすらない判定
-SHORT_WORD_MIN_PHONE_SEC = float(os.getenv("SHORT_WORD_MIN_PHONE_SEC", "0.05"))
+SHORT_WORD_MIN_PHONE_SEC = float(os.getenv("SHORT_WORD_MIN_PHONE_SEC", "0.06"))
 SHORT_WORD_VOWEL_BONUS = float(os.getenv("SHORT_WORD_VOWEL_BONUS", "1.08"))
-SHORT_WORD_STOP_FLOOR = float(os.getenv("SHORT_WORD_STOP_FLOOR", "0.8"))
+SHORT_WORD_STOP_FLOOR = float(os.getenv("SHORT_WORD_STOP_FLOOR", "0.9"))
+SHORT_WORD_MIN_STOP_SEC = float(os.getenv("SHORT_WORD_MIN_STOP_SEC", "0.03"))
 
 # Words allowed to miss without triggering zero-score penalties
 ZERO_SCORE_WORD_WHITELIST = {
@@ -331,7 +332,7 @@ def preprocess_wav_adaptive(
     """モードに応じた前処理"""
     if mode == "word":
         # wordモードの場合はより緩いトリミング
-        y, _ = librosa.effects.trim(wav, top_db=30)
+        y, _ = librosa.effects.trim(wav, top_db=28)
         preemph_coef = 0.9  # より弱いプリエンファシス
     else:
         y, _ = librosa.effects.trim(wav, top_db=20)
@@ -577,6 +578,34 @@ def score(inp: ScoreIn):
     # 単語区間（char_segments の '|' を境界に）
     word_spans = word_spans_from_chars(char_segments)
 
+    # CTCの '|' が欠落して単語数が一致しない場合のフォールバック分割
+    if mode == "word" and len(word_spans) != len(text_words):
+        if char_segments:
+            t0 = char_segments[0]["start"]
+            t1 = char_segments[-1]["end"]
+        else:
+            t0 = 0.0
+            t1 = float(wav_t.size(1) / 16000.0)
+        t1 = max(t1, t0)
+
+        parts = [max(1, len(ws)) for ws in ipa_words]
+        if len(parts) < len(text_words):
+            parts.extend([1] * (len(text_words) - len(parts)))
+        elif len(parts) > len(text_words):
+            parts = parts[: len(text_words)]
+        if not parts:
+            parts = [1] * max(1, len(text_words))
+
+        total = float(sum(parts)) or 1.0
+        cuts = [t0]
+        acc = t0
+        span = t1 - t0
+        for n in parts[:-1]:
+            acc += span * (n / total)
+            cuts.append(acc)
+        cuts.append(t1)
+        word_spans = [(cuts[i], cuts[i + 1]) for i in range(len(parts))]
+
     # 近似: 各単語区間を、その単語の音素数で等分してphone区間を作る→採点
     phone_like = []
     for i, (ws, we) in enumerate(word_spans):
@@ -595,21 +624,28 @@ def score(inp: ScoreIn):
             weights = weights / (weights.sum() + 1e-8)
             target = weights * dur
 
-            min_dur = SHORT_WORD_MIN_PHONE_SEC
-            need = np.maximum(0.0, min_dur - target)
-            if need.sum() > 0 and dur > min_dur * len(phones):
-                extra = float(need.sum())
-                can_give = np.maximum(0.0, target - min_dur)
-                if can_give.sum() > 1e-8:
-                    give_ratio = min(1.0, extra / (can_give.sum() + 1e-8))
-                    target = target - can_give * give_ratio + need
-                else:
-                    target = np.full_like(target, min_dur)
-                    scale = dur / (target.sum() + 1e-8)
-                    target *= scale
+            min_durs = np.full(len(phones), SHORT_WORD_MIN_PHONE_SEC, dtype=np.float32)
+            for idx, phone in enumerate(phones):
+                if _phone_class(phone) == "stop":
+                    min_durs[idx] = SHORT_WORD_MIN_STOP_SEC
+
+            min_total = float(min_durs.sum()) if min_durs.size else 0.0
+            if dur <= min_total and min_total > 0:
+                target = min_durs.copy()
             else:
-                scale = dur / (target.sum() + 1e-8)
-                target *= scale
+                need = np.maximum(0.0, min_durs - target)
+                if need.sum() > 0:
+                    extra = float(need.sum())
+                    can_give = np.maximum(0.0, target - min_durs)
+                    if can_give.sum() > 1e-8:
+                        give_ratio = min(1.0, extra / (can_give.sum() + 1e-8))
+                        target = target - can_give * give_ratio + need
+                    else:
+                        target = min_durs.copy()
+            total = float(target.sum())
+            if total > 0:
+                scale = dur / (total + 1e-8)
+                target = target * scale
 
             seg_lengths = target.astype(np.float32)
         else:

@@ -478,11 +478,11 @@ def score(inp: ScoreIn):
     text_words = text_to_words(inp.text)
 
     if USE_PHONEME:
-        # -------- IPA厳密モード --------
+        # -------- IPA厳密モード（出力を wavlm-ctc 風に整形） --------
+        # 1) 音素アライン
         phones_ipa = ALIGNER.align(wav_t, inp.text)  # [{p,start,end,logp}]
-        phone_like = phones_to_scores(phones_ipa, preset, mode)
 
-        # 単語ごとの音素配列（phonemizerで正解側の分割を取得）
+        # 2) 参照テキストを IPA 単語列に分解
         ipa_str = phonemize(
             inp.text, language="en-us", backend="espeak", strip=True, separator=SEP
         )
@@ -492,31 +492,102 @@ def score(inp: ScoreIn):
             if w.strip()
         ]
 
-        # phone_like を ipa_words の形に合わせて順に切り出し、平均で単語スコア
-        words_scored = words_from_phone_sequence(phone_like, ipa_words, text_words)
+        # 3) phones_ipa を ipa_words の各語の音素数で順にスライス
+        phones_by_word = []
+        cur = 0
+        for ws in ipa_words:
+            n = len(ws)
+            seg = phones_ipa[cur : cur + n]
+            phones_by_word.append(seg)
+            cur += n
+        # 残り（過不足）を末尾語に寄せる
+        if cur < len(phones_ipa) and phones_by_word:
+            phones_by_word[-1].extend(phones_ipa[cur:])
 
+        # 4) 各語の時間幅を等分して chars を合成し、chars.logp は重なり phone.logp の重み平均
+        char_segments = []
+        boundaries = []  # 語境界時刻
+        for i, word in enumerate(text_words):
+            spelled = re.sub(r"\s+", "", word).upper()
+            phs = phones_by_word[i] if i < len(phones_by_word) else []
+            # phones が無い場合でもゼロ長で chars を作り、構造を維持
+            ws = float(phs[0]["start"]) if phs else (boundaries[-1] if boundaries else 0.0)
+            we = float(phs[-1]["end"]) if phs else ws
+            boundaries.append(we)
+
+            L = max(1, len(spelled))
+            dur = max(1e-6, we - ws)
+            step = dur / L
+            # 各文字区間に対し、重なる phone.logp の時間重み平均を計算
+            for j, ch in enumerate(spelled):
+                cs = ws + step * j
+                ce = ws + step * (j + 1)
+                # 重なり計算
+                num, den = 0.0, 0.0
+                raw_vals = []
+                for ph in phs:
+                    ov = max(0.0, min(ce, float(ph["end"])) - max(cs, float(ph["start"])))
+                    if ov > 0:
+                        num += ov * float(ph.get("logp", 0.0))
+                        den += ov
+                        raw_vals.append(float(ph.get("logp", 0.0)))
+                if den > 0:
+                    lp = num / den
+                else:
+                    # フォールバック：その語内 phone の trimmed mean
+                    vals = [float(ph.get("logp", 0.0)) for ph in phs]
+                    lp = trimmed_mean(vals, TRIM_RATIO) if vals else -8.0
+                char_segments.append({"char": ch, "start": cs, "end": ce, "logp": float(lp)})
+
+            # 語区切りを '|' で入れる（0長セグメントで可）
+            if i < len(text_words) - 1:
+                char_segments.append({"char": "|", "start": we, "end": we, "logp": 0.0})
+
+        # 5) word spans を chars から取得
+        word_spans = word_spans_from_chars(char_segments)
+
+        # 6) phone スコアは chars 経由で計算し、各 phone に word を付与
+        phone_like = []
+        for i, phs in enumerate(phones_by_word):
+            if not phs:
+                continue
+            word_label = text_words[i] if i < len(text_words) else f"word{i+1}"
+            scored = score_phones_from_chars(
+                emission=None,
+                approx=[{"p": ph["p"], "start": ph["start"], "end": ph["end"]} for ph in phs],
+                char_segments=char_segments,
+                preset=preset,
+                mode=mode,
+                word_label=word_label,
+            )
+            is_whitelisted = is_whitelisted_zero_word(word_label)
+            for sc in scored:
+                sc["word"] = word_label
+                sc["whitelisted"] = is_whitelisted
+            phone_like.extend(scored)
+
+        # 7) 単語スコアは時間重なりで集計（wavlm-ctc と同様）
+        words_scored = aggregate_word_scores_from_time(word_spans, phone_like, text_words)
+
+        # 8) 全体スコア
         scores_for_mean = [
             w["score"]
             for w in words_scored
             if not (w["score"] == 0 and w.get("whitelisted"))
         ]
-        
-        # モードに応じた全体スコア計算
         base_overall = float(
             np.clip(np.mean(scores_for_mean) if scores_for_mean else 0, 0, 100)
         )
-        
         if mode == "word" and base_overall < 20 and text_length <= MIN_WORD_LENGTH:
             base_overall = 20  # wordモードの最低保証
-        
         overall = int(base_overall)
-        
+
         result = {
             "overall": overall,
             "preset": inp.preset,
             "mode": mode,
             "words": words_scored,
-            "chars": [],  # phoneme-CTCでは文字整列は省略
+            "chars": char_segments[:1000],
             "phones": phone_like[:1000],
             "diagnostics": {
                 "latency_ms": int((time.time() - t0) * 1000),

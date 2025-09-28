@@ -58,6 +58,11 @@ SHORT_WORD_MIN_PHONE_SEC = float(os.getenv("SHORT_WORD_MIN_PHONE_SEC", "0.06"))
 SHORT_WORD_VOWEL_BONUS = float(os.getenv("SHORT_WORD_VOWEL_BONUS", "1.08"))
 SHORT_WORD_STOP_FLOOR = float(os.getenv("SHORT_WORD_STOP_FLOOR", "0.9"))
 SHORT_WORD_MIN_STOP_SEC = float(os.getenv("SHORT_WORD_MIN_STOP_SEC", "0.03"))
+SHORT_WORD_TAIL_PAD_SEC = float(os.getenv("SHORT_WORD_TAIL_PAD_SEC", "0.02"))
+SHORT_WORD_MIN_AFFRICATE_SEC = float(os.getenv("SHORT_WORD_MIN_AFFRICATE_SEC", "0.04"))
+SHORT_WORD_LOGP_TOP_RATIO = float(os.getenv("SHORT_WORD_LOGP_TOP_RATIO", "0.6"))
+SHORT_WORD_LOGP_TRIM_RATIO = float(os.getenv("SHORT_WORD_LOGP_TRIM_RATIO", "0.2"))
+SHORT_WORD_LOGP_CUTOFF = float(os.getenv("SHORT_WORD_LOGP_CUTOFF", "-10.0"))
 
 # Words allowed to miss without triggering zero-score penalties
 ZERO_SCORE_WORD_WHITELIST = {
@@ -107,6 +112,7 @@ _AFFRICATES = {"tʃ", "dʒ"}
 
 def _phone_class(p: str) -> str:
     base = p.replace("ː", "").replace("̩", "")
+    base = base.replace("͡", "").replace("͜", "")
     if base in _VOWELS or any(base.startswith(v) for v in _VOWELS):
         return "vowel"
     if base in _SONORANTS:
@@ -138,7 +144,7 @@ def _short_word_adjust(
         return base_score
 
     cls = _phone_class(phone)
-    if cls == "stop":
+    if cls in {"stop", "aff"}:
         floor = MIN_PHONE_SCORE * SHORT_WORD_STOP_FLOOR
         if logp > -8.0:
             base_score = max(base_score, floor)
@@ -519,6 +525,20 @@ def score(inp: ScoreIn):
             },
         }
 
+        result["raw"] = {
+            "phones": [
+                {
+                    "p": p.get("p"),
+                    "word": p.get("word"),
+                    "start": p.get("start"),
+                    "end": p.get("end"),
+                    "raw_logp": p.get("raw_logp", []),
+                    "logp_used": p.get("logp_used"),
+                }
+                for p in phone_like[:1000]
+            ]
+        }
+
         pretty_print_response("/score result", result)
         return result
 
@@ -614,7 +634,22 @@ def score(inp: ScoreIn):
             continue
         word_label = text_words[i] if i < len(text_words) else f"word{i+1}"
         is_short_word = mode == "word" or len(word_label) <= MIN_WORD_LENGTH
-        dur = max(1e-6, we - ws)
+        word_end = we
+        if is_short_word and char_segments:
+            overlaps = [
+                ch
+                for ch in char_segments
+                if ch["char"] != "|" and max(ws, ch["start"]) < min(we, ch["end"])
+            ]
+            if overlaps:
+                max_end = max(ch["end"] for ch in overlaps)
+                tail_limit = max(ws, max_end + SHORT_WORD_TAIL_PAD_SEC)
+                word_end = min(we, tail_limit)
+                if word_end <= ws:
+                    word_end = min(we, max_end)
+                word_spans[i] = (ws, word_end)
+
+        dur = max(1e-6, word_end - ws)
         approx = []
 
         if is_short_word:
@@ -626,8 +661,11 @@ def score(inp: ScoreIn):
 
             min_durs = np.full(len(phones), SHORT_WORD_MIN_PHONE_SEC, dtype=np.float32)
             for idx, phone in enumerate(phones):
-                if _phone_class(phone) == "stop":
+                cls = _phone_class(phone)
+                if cls == "stop":
                     min_durs[idx] = SHORT_WORD_MIN_STOP_SEC
+                elif cls == "aff":
+                    min_durs[idx] = SHORT_WORD_MIN_AFFRICATE_SEC
 
             min_total = float(min_durs.sum()) if min_durs.size else 0.0
             if dur <= min_total and min_total > 0:
@@ -659,7 +697,7 @@ def score(inp: ScoreIn):
             cur += seg_dur
 
         if approx:
-            approx[-1]["end"] = we
+            approx[-1]["end"] = word_end
 
         scored = score_phones_from_chars(
             emission, approx, char_segments, preset, mode, word_label
@@ -802,6 +840,20 @@ def score(inp: ScoreIn):
             "energy_w_min": float(ENERGY_W_MIN),
             "energy_mask": bool(ENERGY_MASK),
         },
+    }
+
+    result["raw"] = {
+        "phones": [
+            {
+                "p": p.get("p"),
+                "word": p.get("word"),
+                "start": p.get("start"),
+                "end": p.get("end"),
+                "raw_logp": p.get("raw_logp", []),
+                "logp_used": p.get("logp_used"),
+            }
+            for p in phone_like[:1000]
+        ]
     }
 
     pretty_print_response("/score result", result)
@@ -1023,16 +1075,30 @@ def score_phones_from_chars(
         s, e = ph["start"], ph["end"]
         vals = []
         for ch in char_segments:
+            if ch["char"] == "|":
+                continue
             ov = max(0.0, min(e, ch["end"]) - max(s, ch["start"]))
             if ov > 0:
                 vals.append(ch["logp"])
+        raw_vals = [float(v) for v in vals]
         
         # 値が取得できない場合のデフォルト値を調整
         if not vals:
             # wordモードの場合はより寛容なデフォルト値
             lp = -3.0 if mode == "word" else -5.0
         else:
-            lp = float(trimmed_mean(vals, TRIM_RATIO))
+            use_vals = np.array(vals, dtype=np.float32)
+            trim_ratio = TRIM_RATIO
+            if mode == "word" or word_length <= MIN_WORD_LENGTH:
+                trim_ratio = max(TRIM_RATIO, SHORT_WORD_LOGP_TRIM_RATIO)
+                filtered = use_vals[use_vals > SHORT_WORD_LOGP_CUTOFF]
+                if filtered.size > 0:
+                    use_vals = filtered
+                keep_ratio = np.clip(SHORT_WORD_LOGP_TOP_RATIO, 0.0, 1.0)
+                if keep_ratio > 0.0 and use_vals.size > 1:
+                    keep = max(1, int(np.ceil(use_vals.size * keep_ratio)))
+                    use_vals = np.sort(use_vals)[-keep:]
+            lp = float(trimmed_mean(use_vals.tolist(), trim_ratio))
         
         score_val = int(np.clip(to_score(ph, lp), 0, 100))
         scored.append(
@@ -1041,6 +1107,8 @@ def score_phones_from_chars(
                 "start": s,
                 "end": e,
                 "score": score_val,
+                "raw_logp": raw_vals,
+                "logp_used": lp,
             }
         )
     return scored
@@ -1085,6 +1153,8 @@ def phones_to_scores(phones_ipa, preset, mode="sentence"):
                 "start": ph["start"],
                 "end": ph["end"],
                 "score": int(np.clip(to_score(ph), 0, 100)),
+                "raw_logp": [float(ph.get("logp", 0.0))],
+                "logp_used": float(ph.get("logp", 0.0)),
             }
         )
     return out

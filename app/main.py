@@ -64,6 +64,13 @@ SHORT_WORD_LOGP_TOP_RATIO = float(os.getenv("SHORT_WORD_LOGP_TOP_RATIO", "0.6"))
 SHORT_WORD_LOGP_TRIM_RATIO = float(os.getenv("SHORT_WORD_LOGP_TRIM_RATIO", "0.2"))
 SHORT_WORD_LOGP_CUTOFF = float(os.getenv("SHORT_WORD_LOGP_CUTOFF", "-10.0"))
 
+# 語頭破裂音対策（Wordモード向け）
+STOP_OVERLAP_HEAD_PAD_SEC = float(os.getenv("STOP_OVERLAP_HEAD_PAD_SEC", "0.005"))
+STOP_OVERLAP_TAIL_PAD_SEC = float(os.getenv("STOP_OVERLAP_TAIL_PAD_SEC", "0.020"))
+NEAREST_CHAR_SEARCH_SEC = float(os.getenv("NEAREST_CHAR_SEARCH_SEC", "0.040"))
+STOP_PEAK_POOL_RATIO = float(os.getenv("STOP_PEAK_POOL_RATIO", "0.8"))
+FIRST_CHAR_PREJITTER_SEC = float(os.getenv("FIRST_CHAR_PREJITTER_SEC", "0.005"))
+
 # Words allowed to miss without triggering zero-score penalties
 ZERO_SCORE_WORD_WHITELIST = {
     "a",
@@ -658,6 +665,17 @@ def score(inp: ScoreIn):
             )
         char_segments.append({"char": ch, "start": start, "end": end, "logp": seg_mean})
 
+    # Wordモードでは各単語の先頭文字の開始を僅かに前倒しして、語頭破裂音を拾いやすくする
+    if mode == "word" and char_segments:
+        prev_is_bar = True  # 文頭は単語開始とみなす
+        for i, ch in enumerate(char_segments):
+            if ch["char"] == "|":
+                prev_is_bar = True
+                continue
+            if prev_is_bar:
+                ch["start"] = max(0.0, ch["start"] - FIRST_CHAR_PREJITTER_SEC)
+                prev_is_bar = False
+
     # テキスト→IPA（単語ごとに分割）
     ipa_str = phonemize(
         inp.text, language="en-us", backend="espeak", strip=True, separator=SEP
@@ -892,8 +910,8 @@ def score(inp: ScoreIn):
         "diagnostics": {
             "latency_ms": int((time.time() - t0) * 1000),
             "frames": int(emission.size(0)),
-            "backend": ASR_BACKEND,
-            "model_id": ASR_MODEL_ID,
+            # "backend": ASR_BACKEND,
+            # "model_id": ASR_MODEL_ID,
             "mode": mode,
             "sim": float(sim),
             "hyp": hyp_raw,
@@ -1143,40 +1161,73 @@ def score_phones_from_chars(
 
     scored = []
     for ph in approx:
-        s, e = ph["start"], ph["end"]
+        s0, e0 = float(ph["start"]), float(ph["end"])  # 元の区間
+        s, e = s0, e0
+        cls = _phone_class(ph["p"]) if isinstance(ph.get("p"), str) else "other"
+
+        # 語頭破裂音対策：Wordモードでは stop/affricate の重なり判定用に区間を拡張
+        if mode == "word" and cls in {"stop", "aff"}:
+            s = max(0.0, s - STOP_OVERLAP_HEAD_PAD_SEC)
+            e = e + STOP_OVERLAP_TAIL_PAD_SEC
+
         vals = []
         for ch in char_segments:
             if ch["char"] == "|":
                 continue
-            ov = max(0.0, min(e, ch["end"]) - max(s, ch["start"]))
+            ov = max(0.0, min(e, float(ch["end"])) - max(s, float(ch["start"])))
             if ov > 0:
-                vals.append(ch["logp"])
+                vals.append(float(ch["logp"]))
+
+        # 近傍フォールバック：重なりが取れない stop/aff は近い char を採用（Wordモード）
+        if not vals and mode == "word" and cls in {"stop", "aff"}:
+            center = 0.5 * (s0 + e0)
+            best = None
+            best_dist = 1e9
+            for ch in char_segments:
+                if ch["char"] == "|":
+                    continue
+                st, en = float(ch["start"]), float(ch["end"])    
+                if st <= center <= en:
+                    best = float(ch["logp"])
+                    best_dist = 0.0
+                    break
+                # 区間外：最近端までの距離
+                dist = min(abs(center - st), abs(center - en))
+                if dist < best_dist:
+                    best_dist = dist
+                    best = float(ch["logp"])
+            if best is not None and best_dist <= NEAREST_CHAR_SEARCH_SEC:
+                vals.append(best)
+
         raw_vals = [float(v) for v in vals]
-        
+
         # 値が取得できない場合のデフォルト値を調整
         if not vals:
-            # wordモードの場合はより寛容なデフォルト値
             lp = -3.0 if mode == "word" else -5.0
         else:
             use_vals = np.array(vals, dtype=np.float32)
             trim_ratio = TRIM_RATIO
+            # Wordモード/短語では上位値重視＋弱い値のフィルタリング
             if mode == "word" or word_length <= MIN_WORD_LENGTH:
                 trim_ratio = max(TRIM_RATIO, SHORT_WORD_LOGP_TRIM_RATIO)
                 filtered = use_vals[use_vals > SHORT_WORD_LOGP_CUTOFF]
                 if filtered.size > 0:
                     use_vals = filtered
                 keep_ratio = np.clip(SHORT_WORD_LOGP_TOP_RATIO, 0.0, 1.0)
+                # stop/aff はさらにピーク寄りに
+                if cls in {"stop", "aff"}:
+                    keep_ratio = max(float(keep_ratio), float(STOP_PEAK_POOL_RATIO))
                 if keep_ratio > 0.0 and use_vals.size > 1:
                     keep = max(1, int(np.ceil(use_vals.size * keep_ratio)))
                     use_vals = np.sort(use_vals)[-keep:]
             lp = float(trimmed_mean(use_vals.tolist(), trim_ratio))
-        
+
         score_val = int(np.clip(to_score(ph, lp), 0, 100))
         scored.append(
             {
                 "p": ph["p"],
-                "start": s,
-                "end": e,
+                "start": s0,
+                "end": e0,
                 "score": score_val,
                 "raw_logp": raw_vals,
                 "logp_used": lp,

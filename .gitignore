@@ -1,3 +1,17 @@
 models/*
 .DS_Store
 .env
+
+# Python キャッシュ
+__pycache__/
+*.pyc
+*.pyo
+
+# 音声データ
+data/
+*.wav
+*.mp3
+*.flac
+
+# システムファイル
+Thumbs.db

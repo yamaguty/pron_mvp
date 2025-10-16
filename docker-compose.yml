@@ -1,15 +1,18 @@
 services:
   api:
     build: .
-    ports: ["8000:8000"]
+    ports:
+      - "8000:8000"
     environment:
       HF_HOME: /models/hf
+      HF_TOKEN: ${HF_TOKEN}
       TORCH_HOME: /models/torch
       TOKENIZERS_PARALLELISM: "false"
       # マシンのvCPUに合わせて調整（例: 8vCPUなら8）
-      OMP_NUM_THREADS: 4
-      MKL_NUM_THREADS: 4
+      OMP_NUM_THREADS: "10"
+      MKL_NUM_THREADS: "10"
       # まずは高速モード（文字CTC→近似IPA）で1秒未満を目指す
+      ASR_MODEL_ID: patrickvonplaten/wavlm-libri-clean-100h-base-plus
       USE_PHONEME_BACKEND: "false"
       PHONEME_MODEL: facebook/wav2vec2-lv-60-espeak-cv-ft
     volumes:

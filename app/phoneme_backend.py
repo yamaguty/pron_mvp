@@ -1,7 +1,7 @@
 from __future__ import annotations
 import torch, numpy as np
 from typing import List, Dict
-from transformers import AutoProcessor, Wav2Vec2ForCTC
+from transformers import AutoModelForCTC, AutoProcessor
 from phonemizer import phonemize
 from phonemizer.separator import Separator
 from ctc_align import build_trellis, backtrack, merge_repeats
@@ -14,9 +14,19 @@ class PhonemeAligner:
         device: str = "cpu",
     ):
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = Wav2Vec2ForCTC.from_pretrained(model_id).to(device).eval()
+        try:
+            self.device = torch.device(device)
+        except (TypeError, RuntimeError):
+            self.device = torch.device("cpu")
+        self.model = AutoModelForCTC.from_pretrained(model_id).to(self.device).eval()
         self.vocab = self.processor.tokenizer.get_vocab()
-        self.blank_id = self.processor.tokenizer.pad_token_id or 0
+        self.blank_id = self.processor.tokenizer.pad_token_id
+        if self.blank_id is None:
+            self.blank_id = getattr(
+                self.processor.tokenizer, "word_delimiter_token_id", None
+            )
+        if self.blank_id is None:
+            self.blank_id = 0
         self.sep = Separator(phone=" ", word="|", syllable="")
 
     def _ipa_tokens(self, text: str) -> List[str]:
@@ -39,8 +49,9 @@ class PhonemeAligner:
         with torch.inference_mode():
             x = wav_t.squeeze(0).detach().cpu().numpy()
             inputs = self.processor(x, sampling_rate=16000, return_tensors="pt")
-            logits = self.model(inputs.input_values).logits
-            em = torch.log_softmax(logits, dim=-1).squeeze(0)  # (T, V)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            logits = self.model(**inputs).logits
+            em = torch.log_softmax(logits, dim=-1).squeeze(0).cpu()  # (T, V)
         return em
 
     def align(self, wav_t: torch.Tensor, text: str) -> List[Dict]:
